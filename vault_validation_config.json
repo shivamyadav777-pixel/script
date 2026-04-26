@@ -1,0 +1,211 @@
+{
+  "environments": {
+    "le1": {
+      "kv_test_path": "kvtest/test",
+      "vault_token": "",
+      "aws_profile": "<aws_profile_for_le1>",
+      "aws_region": "<aws_region_for_le1>",
+      "replication_check_command": [
+        "vault",
+        "read",
+        "-format=json",
+        "<team_replication_check_path_or_replace_with_exact_command>"
+      ],
+      "maintenance_pipelines": [
+        "<le1_pipeline_1>",
+        "<le1_pipeline_2>",
+        "<le1_pipeline_3>"
+      ],
+      "primary": {
+        "vault_addr": "https://<le1-primary-vault-url>",
+        "snapshot_bucket": "vault-<inc-or-team-name>-primary-raft-snapshots",
+        "snapshot_prefix": "raft-snapshots/",
+        "nodes": [
+          {
+            "name": "<le1-primary-node-1>",
+            "health_url": "https://<le1-primary-node-1>:8200/v1/sys/health"
+          },
+          {
+            "name": "<le1-primary-node-2>",
+            "health_url": "https://<le1-primary-node-2>:8200/v1/sys/health"
+          },
+          {
+            "name": "<le1-primary-node-3>",
+            "health_url": "https://<le1-primary-node-3>:8200/v1/sys/health"
+          },
+          {
+            "name": "<le1-primary-node-4>",
+            "health_url": "https://<le1-primary-node-4>:8200/v1/sys/health"
+          },
+          {
+            "name": "<le1-primary-node-5>",
+            "health_url": "https://<le1-primary-node-5>:8200/v1/sys/health"
+          }
+        ]
+      },
+      "dr": {
+        "vault_addr": "https://<le1-dr-vault-url>",
+        "nodes": [
+          {
+            "name": "<le1-dr-node-1>",
+            "health_url": "https://<le1-dr-node-1>:8200/v1/sys/health"
+          },
+          {
+            "name": "<le1-dr-node-2>",
+            "health_url": "https://<le1-dr-node-2>:8200/v1/sys/health"
+          },
+          {
+            "name": "<le1-dr-node-3>",
+            "health_url": "https://<le1-dr-node-3>:8200/v1/sys/health"
+          },
+          {
+            "name": "<le1-dr-node-4>",
+            "health_url": "https://<le1-dr-node-4>:8200/v1/sys/health"
+          },
+          {
+            "name": "<le1-dr-node-5>",
+            "health_url": "https://<le1-dr-node-5>:8200/v1/sys/health"
+          }
+        ]
+      }
+    },
+    "xe1": {
+      "kv_test_path": "kvtest/test",
+      "vault_token": "",
+      "aws_profile": "<aws_profile_for_xe1>",
+      "aws_region": "<aws_region_for_xe1>",
+      "replication_check_command": [
+        "vault",
+        "read",
+        "-format=json",
+        "<team_replication_check_path_or_replace_with_exact_command>"
+      ],
+      "maintenance_pipelines": [
+        "<xe1_pipeline_1>",
+        "<xe1_pipeline_2>",
+        "<xe1_pipeline_3>"
+      ],
+      "primary": {
+        "vault_addr": "https://<xe1-primary-vault-url>",
+        "snapshot_bucket": "vault-<nprd-or-team-name>-primary-raft-snapshots",
+        "snapshot_prefix": "raft-snapshots/",
+        "nodes": [
+          {
+            "name": "<xe1-primary-node-1>",
+            "health_url": "https://<xe1-primary-node-1>:8200/v1/sys/health"
+          },
+          {
+            "name": "<xe1-primary-node-2>",
+            "health_url": "https://<xe1-primary-node-2>:8200/v1/sys/health"
+          },
+          {
+            "name": "<xe1-primary-node-3>",
+            "health_url": "https://<xe1-primary-node-3>:8200/v1/sys/health"
+          },
+          {
+            "name": "<xe1-primary-node-4>",
+            "health_url": "https://<xe1-primary-node-4>:8200/v1/sys/health"
+          },
+          {
+            "name": "<xe1-primary-node-5>",
+            "health_url": "https://<xe1-primary-node-5>:8200/v1/sys/health"
+          }
+        ]
+      },
+      "dr": {
+        "vault_addr": "https://<xe1-dr-vault-url>",
+        "nodes": [
+          {
+            "name": "<xe1-dr-node-1>",
+            "health_url": "https://<xe1-dr-node-1>:8200/v1/sys/health"
+          },
+          {
+            "name": "<xe1-dr-node-2>",
+            "health_url": "https://<xe1-dr-node-2>:8200/v1/sys/health"
+          },
+          {
+            "name": "<xe1-dr-node-3>",
+            "health_url": "https://<xe1-dr-node-3>:8200/v1/sys/health"
+          },
+          {
+            "name": "<xe1-dr-node-4>",
+            "health_url": "https://<xe1-dr-node-4>:8200/v1/sys/health"
+          },
+          {
+            "name": "<xe1-dr-node-5>",
+            "health_url": "https://<xe1-dr-node-5>:8200/v1/sys/health"
+          }
+        ]
+      }
+    },
+    "pe1": {
+      "kv_test_path": "kvtest/test",
+      "vault_token": "",
+      "aws_profile": "<aws_profile_for_pe1>",
+      "aws_region": "<aws_region_for_pe1>",
+      "replication_check_command": [
+        "vault",
+        "read",
+        "-format=json",
+        "<team_replication_check_path_or_replace_with_exact_command>"
+      ],
+      "maintenance_pipelines": [
+        "<pe1_pipeline_1>",
+        "<pe1_pipeline_2>",
+        "<pe1_pipeline_3>"
+      ],
+      "primary": {
+        "vault_addr": "https://<pe1-primary-vault-url>",
+        "snapshot_bucket": "vault-<prod-or-team-name>-primary-raft-snapshots",
+        "snapshot_prefix": "raft-snapshots/",
+        "nodes": [
+          {
+            "name": "<pe1-primary-node-1>",
+            "health_url": "https://<pe1-primary-node-1>:8200/v1/sys/health"
+          },
+          {
+            "name": "<pe1-primary-node-2>",
+            "health_url": "https://<pe1-primary-node-2>:8200/v1/sys/health"
+          },
+          {
+            "name": "<pe1-primary-node-3>",
+            "health_url": "https://<pe1-primary-node-3>:8200/v1/sys/health"
+          },
+          {
+            "name": "<pe1-primary-node-4>",
+            "health_url": "https://<pe1-primary-node-4>:8200/v1/sys/health"
+          },
+          {
+            "name": "<pe1-primary-node-5>",
+            "health_url": "https://<pe1-primary-node-5>:8200/v1/sys/health"
+          }
+        ]
+      },
+      "dr": {
+        "vault_addr": "https://<pe1-dr-vault-url>",
+        "nodes": [
+          {
+            "name": "<pe1-dr-node-1>",
+            "health_url": "https://<pe1-dr-node-1>:8200/v1/sys/health"
+          },
+          {
+            "name": "<pe1-dr-node-2>",
+            "health_url": "https://<pe1-dr-node-2>:8200/v1/sys/health"
+          },
+          {
+            "name": "<pe1-dr-node-3>",
+            "health_url": "https://<pe1-dr-node-3>:8200/v1/sys/health"
+          },
+          {
+            "name": "<pe1-dr-node-4>",
+            "health_url": "https://<pe1-dr-node-4>:8200/v1/sys/health"
+          },
+          {
+            "name": "<pe1-dr-node-5>",
+            "health_url": "https://<pe1-dr-node-5>:8200/v1/sys/health"
+          }
+        ]
+      }
+    }
+  }
+}
