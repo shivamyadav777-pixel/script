@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import argparse
 import json
 import mimetypes
 import random
@@ -8,12 +7,12 @@ import ssl
 import subprocess
 import sys
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from html import escape
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -21,11 +20,86 @@ class CheckResult:
     name: str
     status: str
     details: str
+    category: str = "General"
     evidence: Dict[str, Any] = field(default_factory=dict)
+    raw_output: Optional[str] = None
 
 
 class ValidationError(Exception):
     pass
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_now_str() -> str:
+    return utc_now().strftime("%Y%m%d%H%M%S")
+
+
+def prompt_input(prompt: str) -> str:
+    while True:
+        value = input(f"{prompt}: ").strip()
+        if value:
+            return value
+        print("Value is required.")
+
+
+def mask_secret(value: Optional[str], keep: int = 4) -> str:
+    if not value:
+        return ""
+    if len(value) <= keep:
+        return "*" * len(value)
+    return "*" * (len(value) - keep) + value[-keep:]
+
+
+def read_text_file(path: Path) -> str:
+    if not path.exists():
+        raise ValidationError(f"Required file not found: {path}")
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        raise ValidationError(f"Required file is empty: {path}")
+    return content
+
+
+def read_token_file(path: Path) -> str:
+    return read_text_file(path)
+
+
+def load_simple_env_file(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        raise ValidationError(f"AWS credentials file not found: {path}")
+
+    env_vars: Dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env_vars[key.strip()] = value.strip().strip('"').strip("'")
+
+    if not env_vars:
+        raise ValidationError(f"AWS credentials file has no usable KEY=VALUE entries: {path}")
+
+    return env_vars
+
+
+def build_env(
+    base_env: Dict[str, str],
+    vault_addr: Optional[str] = None,
+    vault_token: Optional[str] = None,
+    extra_env: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    merged = dict(base_env)
+    if extra_env:
+        merged.update(extra_env)
+    if vault_addr:
+        merged["VAULT_ADDR"] = vault_addr
+    if vault_token:
+        merged["VAULT_TOKEN"] = vault_token
+    return merged
 
 
 def run_cmd(
@@ -49,61 +123,126 @@ def run_cmd(
     return result
 
 
-def run_json_cmd(cmd: List[str], env: Optional[Dict[str, str]] = None) -> Any:
+def run_json_cmd(cmd: List[str], env: Optional[Dict[str, str]] = None) -> Tuple[Any, str]:
     result = run_cmd(cmd, env=env)
+    raw = result.stdout.strip()
     try:
-        return json.loads(result.stdout)
+        return json.loads(raw), raw
     except json.JSONDecodeError as exc:
         raise ValidationError(
-            f"Expected JSON output from: {' '.join(cmd)}\nOutput was:\n{result.stdout}"
+            f"Expected JSON output from: {' '.join(cmd)}\nOutput was:\n{raw}"
         ) from exc
 
 
-def utc_now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+def health_get_json(url: str, token: str) -> Dict[str, Any]:
+    req = urllib.request.Request(url, headers={"X-Vault-Token": token})
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, context=ctx, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
-def build_env(base_env: Dict[str, str], vault_addr: str, vault_token: Optional[str]) -> Dict[str, str]:
-    merged = dict(base_env)
-    merged["VAULT_ADDR"] = vault_addr
-    if vault_token:
-        merged["VAULT_TOKEN"] = vault_token
-    return merged
+def json_to_pretty(value: Any) -> str:
+    return json.dumps(value, indent=2, sort_keys=True)
 
 
-def check_vault_login(env_vars: Dict[str, str]) -> CheckResult:
-    data = run_json_cmd(["vault", "token", "lookup", "-format=json"], env=env_vars)
+def overall_status(results: List[CheckResult]) -> str:
+    if any(r.status == "FAIL" for r in results):
+        return "FAIL"
+    if any(r.status == "MANUAL" for r in results):
+        return "PARTIAL"
+    return "PASS"
+
+
+def safe_run_check(results: List[CheckResult], name: str, category: str, fn):
+    try:
+        results.append(fn())
+    except ValidationError as exc:
+        results.append(CheckResult(name=name, status="FAIL", details=str(exc), category=category))
+    except Exception as exc:
+        results.append(CheckResult(name=name, status="FAIL", details=f"Unexpected error: {exc}", category=category))
+
+
+def check_vault_login(env_vars: Dict[str, str], cluster_label: str) -> CheckResult:
+    data, raw = run_json_cmd(["vault", "token", "lookup", "-format=json"], env=env_vars)
     return CheckResult(
-        name="Vault login",
+        name=f"Vault login ({cluster_label})",
         status="PASS",
         details="Vault token is valid.",
-        evidence={"display_name": data.get("data", {}).get("display_name")}
+        category="Access",
+        evidence={
+            "display_name": data.get("data", {}).get("display_name"),
+            "policies": data.get("data", {}).get("policies", []),
+        },
+        raw_output=raw,
     )
 
 
 def check_secret_rw(env_vars: Dict[str, str], mount_path: str) -> CheckResult:
     key = f"ami_validation_{utc_now_str()}"
     value = "ok"
-
     run_cmd(["vault", "kv", "put", mount_path, f"{key}={value}"], env=env_vars)
-    secret_data = run_json_cmd(["vault", "kv", "get", "-format=json", mount_path], env=env_vars)
-
+    secret_data, raw = run_json_cmd(["vault", "kv", "get", "-format=json", mount_path], env=env_vars)
     actual = secret_data.get("data", {}).get("data", {}).get(key)
+
     if actual != value:
         raise ValidationError(f"Secret write/read mismatch. Expected {value}, got {actual}")
 
     return CheckResult(
         name="Secret read/write",
         status="PASS",
-        details=f"Successfully wrote and read key '{key}' in {mount_path}.",
-        evidence={"path": mount_path, "key": key, "value": actual}
+        details=f"Successfully wrote and read temporary key '{key}' in {mount_path}.",
+        category="Functional",
+        evidence={"path": mount_path, "key": key, "value": actual},
+        raw_output=raw,
+    )
+
+
+def check_ui_manual() -> CheckResult:
+    return CheckResult(
+        name="Vault UI validation",
+        status="MANUAL",
+        details="Validate UI read/write if still required by team policy.",
+        category="Functional",
+    )
+
+
+def check_unsealed_nodes(cluster_name: str, nodes: List[Dict[str, str]], vault_token: str) -> CheckResult:
+    failures = []
+    node_results = []
+
+    for node in nodes:
+        payload = health_get_json(node["health_url"], vault_token)
+        sealed = payload.get("sealed")
+        node_results.append(
+            {
+                "node": node["name"],
+                "sealed": sealed,
+                "standby": payload.get("standby"),
+                "initialized": payload.get("initialized"),
+                "performance_standby": payload.get("performance_standby"),
+                "replication_dr_mode": payload.get("replication_dr_mode"),
+                "server_time_utc": payload.get("server_time_utc"),
+            }
+        )
+        if sealed is not False:
+            failures.append(node["name"])
+
+    if failures:
+        raise ValidationError(f"{cluster_name}: sealed nodes found: {', '.join(failures)}")
+
+    return CheckResult(
+        name=f"Unsealed nodes ({cluster_name})",
+        status="PASS",
+        details=f"All configured {cluster_name} nodes are unsealed.",
+        category="Cluster Health",
+        evidence={"nodes": node_results},
+        raw_output=json_to_pretty(node_results),
     )
 
 
 def check_raft_peers(env_vars: Dict[str, str], cluster_name: str, expected_total: int = 5) -> CheckResult:
-    data = run_json_cmd(["vault", "operator", "raft", "list-peers", "-format=json"], env=env_vars)
+    data, raw = run_json_cmd(["vault", "operator", "raft", "list-peers", "-format=json"], env=env_vars)
     peers = data.get("data", {}).get("config", {}).get("servers", [])
-
     total = len(peers)
     leaders = [peer for peer in peers if peer.get("leader") is True]
     followers = [peer for peer in peers if peer.get("leader") is not True]
@@ -118,130 +257,141 @@ def check_raft_peers(env_vars: Dict[str, str], cluster_name: str, expected_total
     return CheckResult(
         name=f"Raft peers ({cluster_name})",
         status="PASS",
-        details=f"{cluster_name} has {total} peers: 1 leader and {len(followers)} followers.",
-        evidence={"servers": peers}
+        details=f"{cluster_name} has {total} peers with 1 leader and {len(followers)} followers.",
+        category="Raft",
+        evidence={
+            "peer_count": total,
+            "leader_count": len(leaders),
+            "follower_count": len(followers),
+            "servers": peers,
+        },
+        raw_output=raw,
+    )
+
+
+def check_replication_primary(env_vars: Dict[str, str]) -> CheckResult:
+    data, raw = run_json_cmd(["vault", "read", "-format=json", "sys/replication/dr/status"], env=env_vars)
+    payload = data.get("data", {})
+    state = payload.get("state")
+    last_wal = payload.get("last_wal")
+    last_dr_wal = payload.get("last_dr_wal")
+
+    if str(state).lower() != "running":
+        raise ValidationError(f"DR primary state is not running. Found: {state}")
+
+    return CheckResult(
+        name="DR primary replication status",
+        status="PASS",
+        details=f"Primary DR state is '{state}' with last_wal={last_wal}.",
+        category="Replication",
+        evidence={
+            "mode": payload.get("mode"),
+            "state": state,
+            "last_wal": last_wal,
+            "last_dr_wal": last_dr_wal,
+            "secondaries": payload.get("secondaries", []),
+        },
+        raw_output=raw,
+    )
+
+
+def check_replication_secondary(env_vars: Dict[str, str]) -> CheckResult:
+    data, raw = run_json_cmd(["vault", "read", "-format=json", "sys/replication/dr/status"], env=env_vars)
+    payload = data.get("data", {})
+    state = payload.get("state")
+    connection_state = payload.get("connection_state")
+    last_remote_wal = payload.get("last_remote_wal")
+    primaries = payload.get("primaries", [])
+    connection_status = primaries[0].get("connection_status") if primaries else None
+
+    if str(state).lower() != "stream-wals":
+        raise ValidationError(f"DR secondary state is not stream-wals. Found: {state}")
+    if str(connection_state).lower() not in {"ready", "connected"}:
+        raise ValidationError(f"DR secondary connection_state is unexpected: {connection_state}")
+    if connection_status and str(connection_status).lower() != "connected":
+        raise ValidationError(f"DR secondary connection_status is unexpected: {connection_status}")
+
+    return CheckResult(
+        name="DR secondary replication status",
+        status="PASS",
+        details=f"Secondary DR state is '{state}', connection_state='{connection_state}', last_remote_wal={last_remote_wal}.",
+        category="Replication",
+        evidence={
+            "mode": payload.get("mode"),
+            "state": state,
+            "connection_state": connection_state,
+            "last_remote_wal": last_remote_wal,
+            "connection_status": connection_status,
+            "primaries": primaries,
+        },
+        raw_output=raw,
     )
 
 
 def check_snapshot_status(env_vars: Dict[str, str]) -> CheckResult:
-    status_data = run_json_cmd(
+    status_data, raw_status = run_json_cmd(
         ["vault", "read", "-format=json", "sys/storage/raft/snapshot-auto/status/s3"],
-        env=env_vars
+        env=env_vars,
     )
-    config_data = run_json_cmd(
+    config_data, raw_config = run_json_cmd(
         ["vault", "read", "-format=json", "sys/storage/raft/snapshot-auto/config/s3"],
-        env=env_vars
+        env=env_vars,
     )
 
     return CheckResult(
         name="Snapshot auto status",
         status="PASS",
         details="Retrieved raft snapshot auto status and config.",
+        category="Snapshots",
         evidence={
             "status": status_data.get("data", {}),
-            "config": config_data.get("data", {})
-        }
+            "config": config_data.get("data", {}),
+        },
+        raw_output=f"STATUS\n{raw_status}\n\nCONFIG\n{raw_config}",
     )
 
 
-def check_s3_snapshot(bucket: str, prefix: str, aws_profile: Optional[str] = None, aws_region: Optional[str] = None) -> CheckResult:
+def check_autopilot_config(env_vars: Dict[str, str], cluster_name: str) -> CheckResult:
+    data, raw = run_json_cmd(["vault", "operator", "raft", "autopilot", "get-config", "-format=json"], env=env_vars)
+    payload = data.get("data", data)
+
+    return CheckResult(
+        name=f"Autopilot config ({cluster_name})",
+        status="PASS",
+        details=f"Retrieved autopilot config for {cluster_name}.",
+        category="Raft",
+        evidence=payload,
+        raw_output=raw,
+    )
+
+
+def check_s3_snapshot(bucket: str, prefix: str, aws_env: Dict[str, str], aws_profile: Optional[str], aws_region: Optional[str]) -> CheckResult:
     cmd = ["aws"]
     if aws_profile:
         cmd.extend(["--profile", aws_profile])
     if aws_region:
         cmd.extend(["--region", aws_region])
+    cmd.extend(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix])
 
-    cmd.extend([
-        "s3api",
-        "list-objects-v2",
-        "--bucket", bucket,
-        "--prefix", prefix
-    ])
-
-    data = run_json_cmd(cmd)
+    data, raw = run_json_cmd(cmd, env=aws_env)
     contents = data.get("Contents", [])
     if not contents:
         raise ValidationError(f"No snapshot objects found in s3://{bucket}/{prefix}")
 
     latest = max(contents, key=lambda obj: obj["LastModified"])
     return CheckResult(
-        name="S3 snapshot freshness",
+        name="Latest S3 snapshot",
         status="PASS",
-        details=f"Latest snapshot found: {latest['Key']}",
+        details=f"Latest snapshot is {latest['Key']} at {latest['LastModified']}.",
+        category="Snapshots",
         evidence={
             "bucket": bucket,
             "prefix": prefix,
             "latest_key": latest["Key"],
-            "last_modified": latest["LastModified"]
-        }
-    )
-
-
-def check_unsealed_nodes(cluster_name: str, nodes: List[Dict[str, str]], vault_token: str) -> CheckResult:
-    failures = []
-    results = []
-    ssl_context = ssl.create_default_context()
-
-    for node in nodes:
-        url = node["health_url"]
-        req = urllib.request.Request(url, headers={"X-Vault-Token": vault_token})
-        try:
-            with urllib.request.urlopen(req, context=ssl_context, timeout=15) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except Exception as exc:
-            failures.append({"node": node["name"], "error": str(exc)})
-            continue
-
-        sealed = payload.get("sealed")
-        standby = payload.get("standby")
-        initialized = payload.get("initialized")
-
-        node_result = {
-            "node": node["name"],
-            "sealed": sealed,
-            "standby": standby,
-            "initialized": initialized,
-            "cluster_name": payload.get("cluster_name")
-        }
-        results.append(node_result)
-
-        if sealed is not False:
-            failures.append({"node": node["name"], "error": f"sealed={sealed}"})
-
-    if failures:
-        raise ValidationError(f"{cluster_name}: unseal check failed for nodes: {failures}")
-
-    return CheckResult(
-        name=f"Unsealed nodes ({cluster_name})",
-        status="PASS",
-        details=f"All nodes in {cluster_name} are unsealed.",
-        evidence={"nodes": results}
-    )
-
-
-def check_replication(env_name: str, config: Dict[str, Any], env_vars: Dict[str, str]) -> CheckResult:
-    command = config.get("replication_check_command")
-    if not command:
-        return CheckResult(
-            name="Replication health",
-            status="MANUAL",
-            details=f"No replication command configured for {env_name}. Add your team-approved check from the runbook.",
-            evidence={}
-        )
-
-    result = run_cmd(command, env=env_vars, check=False)
-    status = "PASS" if result.returncode == 0 else "FAIL"
-
-    return CheckResult(
-        name="Replication health",
-        status=status,
-        details="Executed configured replication check command.",
-        evidence={
-            "command": command,
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr
-        }
+            "last_modified": latest["LastModified"],
+            "object_count": len(contents),
+        },
+        raw_output=raw,
     )
 
 
@@ -252,7 +402,7 @@ def check_concourse(env_name: str, config: Dict[str, Any]) -> CheckResult:
             name="Daily maintenance pipeline",
             status="MANUAL",
             details=f"No pipeline list configured for {env_name}.",
-            evidence={}
+            category="Operations",
         )
 
     chosen = random.choice(pipelines)
@@ -260,45 +410,64 @@ def check_concourse(env_name: str, config: Dict[str, Any]) -> CheckResult:
         name="Daily maintenance pipeline",
         status="MANUAL",
         details=f"Randomly selected pipeline '{chosen}'. Trigger and confirm success through Concourse CLI/API.",
-        evidence={"selected_pipeline": chosen}
+        category="Operations",
+        evidence={"selected_pipeline": chosen},
     )
 
 
-def summarize(results: List[CheckResult]) -> str:
-    overall = "PASS"
+def status_color(status: str) -> str:
+    return {
+        "PASS": "#157347",
+        "FAIL": "#b42318",
+        "MANUAL": "#b26b00",
+        "PARTIAL": "#8a6d1d",
+    }.get(status, "#475467")
+
+
+def metric_card(label: str, value: str) -> str:
+    return f"""
+    <div class="metric-card">
+      <div class="metric-label">{escape(label)}</div>
+      <div class="metric-value">{escape(value)}</div>
+    </div>
+    """
+
+
+def render_html_report(environment: str, results: List[CheckResult], metadata: Dict[str, Any], timestamp_utc: str) -> str:
+    overall = overall_status(results)
+    primary_replication = next((r for r in results if r.name == "DR primary replication status"), None)
+    secondary_replication = next((r for r in results if r.name == "DR secondary replication status"), None)
+    primary_raft = next((r for r in results if r.name == "Raft peers (primary)"), None)
+    dr_raft = next((r for r in results if r.name == "Raft peers (dr)"), None)
+    s3_snap = next((r for r in results if r.name == "Latest S3 snapshot"), None)
+
+    summary_metrics = []
+    if primary_raft:
+        summary_metrics.append(metric_card("Primary Raft Peers", str(primary_raft.evidence.get("peer_count", "N/A"))))
+    if dr_raft:
+        summary_metrics.append(metric_card("DR Raft Peers", str(dr_raft.evidence.get("peer_count", "N/A"))))
+    if primary_replication:
+        summary_metrics.append(metric_card("DR Primary State", str(primary_replication.evidence.get("state", "N/A"))))
+        summary_metrics.append(metric_card("Primary Last WAL", str(primary_replication.evidence.get("last_wal", "N/A"))))
+    if secondary_replication:
+        summary_metrics.append(metric_card("DR Secondary State", str(secondary_replication.evidence.get("state", "N/A"))))
+        summary_metrics.append(metric_card("Connection State", str(secondary_replication.evidence.get("connection_state", "N/A"))))
+        summary_metrics.append(metric_card("Last Remote WAL", str(secondary_replication.evidence.get("last_remote_wal", "N/A"))))
+    if s3_snap:
+        summary_metrics.append(metric_card("Latest Snapshot Time", str(s3_snap.evidence.get("last_modified", "N/A"))))
+
+    table_rows = []
     for result in results:
-        if result.status == "FAIL":
-            overall = "FAIL"
-            break
-        if result.status == "MANUAL" and overall != "FAIL":
-            overall = "PARTIAL"
-
-    lines = [f"Overall result: {overall}", ""]
-    for result in results:
-        lines.append(f"[{result.status}] {result.name}: {result.details}")
-    return "\n".join(lines)
-
-
-def render_html_report(environment: str, results: List[CheckResult], timestamp_utc: str) -> str:
-    def color(status: str) -> str:
-        return {
-            "PASS": "#1f7a1f",
-            "FAIL": "#b42318",
-            "MANUAL": "#b26b00",
-            "PARTIAL": "#7a5c00"
-        }.get(status, "#444")
-
-    overall = summarize(results).splitlines()[0].replace("Overall result: ", "")
-
-    rows = []
-    for result in results:
-        evidence = escape(json.dumps(result.evidence, indent=2)) if result.evidence else "N/A"
-        rows.append(f"""
+        evidence = "N/A" if not result.evidence else escape(json.dumps(result.evidence, indent=2))
+        raw_output = escape(result.raw_output) if result.raw_output else "N/A"
+        table_rows.append(f"""
         <tr>
+          <td>{escape(result.category)}</td>
           <td><strong>{escape(result.name)}</strong></td>
-          <td style="color:{color(result.status)};font-weight:700;">{escape(result.status)}</td>
+          <td><span class="badge" style="background:{status_color(result.status)};">{escape(result.status)}</span></td>
           <td>{escape(result.details)}</td>
           <td><pre>{evidence}</pre></td>
+          <td><details><summary>View</summary><pre>{raw_output}</pre></details></td>
         </tr>
         """)
 
@@ -309,81 +478,162 @@ def render_html_report(environment: str, results: List[CheckResult], timestamp_u
   <title>Vault AMI Validation Report - {escape(environment)}</title>
   <style>
     body {{
-      font-family: Segoe UI, Arial, sans-serif;
-      margin: 24px;
-      background: #f4f7fb;
-      color: #1f2937;
+      margin: 0;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: linear-gradient(180deg, #f7fbfd 0%, #eef4f8 100%);
+      color: #0f172a;
     }}
-    .card {{
-      max-width: 1200px;
+    .wrap {{
+      max-width: 1400px;
       margin: 0 auto;
-      background: #ffffff;
-      border-radius: 16px;
       padding: 28px;
-      box-shadow: 0 12px 32px rgba(15, 23, 42, 0.10);
     }}
-    h1 {{
-      margin: 0 0 12px 0;
+    .hero {{
+      background: linear-gradient(135deg, #083344 0%, #0f766e 55%, #155e75 100%);
+      color: white;
+      border-radius: 24px;
+      padding: 28px;
+      margin-bottom: 24px;
     }}
-    .meta {{
-      color: #475467;
-      margin-bottom: 20px;
-    }}
-    .badge {{
+    .overall {{
       display: inline-block;
-      padding: 8px 14px;
+      margin-top: 14px;
+      padding: 10px 18px;
       border-radius: 999px;
       font-weight: 700;
-      color: #ffffff;
-      background: {color(overall)};
-      margin-top: 10px;
+      background: """ + status_color(overall) + """;
+      color: white;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin: 18px 0 26px 0;
+    }}
+    .metric-card {{
+      background: white;
+      border: 1px solid #dbe4ea;
+      border-radius: 18px;
+      padding: 16px;
+    }}
+    .metric-label {{
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #475467;
+      margin-bottom: 8px;
+    }}
+    .metric-value {{
+      font-size: 24px;
+      font-weight: 700;
+    }}
+    .section {{
+      background: white;
+      border: 1px solid #dbe4ea;
+      border-radius: 22px;
+      padding: 22px;
+      margin-bottom: 20px;
+    }}
+    .meta {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+    }}
+    .meta div {{
+      background: #f8fbfc;
+      border: 1px solid #dbe4ea;
+      border-radius: 14px;
+      padding: 12px 14px;
+    }}
+    .meta strong {{
+      display: block;
+      color: #475467;
+      font-size: 12px;
+      text-transform: uppercase;
+      margin-bottom: 6px;
     }}
     table {{
       width: 100%;
       border-collapse: collapse;
-      margin-top: 20px;
+      font-size: 14px;
     }}
     th, td {{
       text-align: left;
       padding: 12px;
-      border-bottom: 1px solid #e5e7eb;
+      border-bottom: 1px solid #dbe4ea;
       vertical-align: top;
     }}
     th {{
-      background: #f8fafc;
+      background: #f5f9fb;
     }}
     pre {{
+      margin: 0;
       white-space: pre-wrap;
       word-break: break-word;
-      margin: 0;
-      font-size: 12px;
       background: #f8fafc;
-      padding: 10px;
-      border-radius: 8px;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 12px;
+      font-size: 12px;
+      max-height: 280px;
+      overflow: auto;
+    }}
+    .badge {{
+      color: white;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: 12px;
+      display: inline-block;
     }}
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>Vault AMI Validation Report</h1>
-    <div class="meta">
-      <div><strong>Environment:</strong> {escape(environment)}</div>
-      <div><strong>Timestamp (UTC):</strong> {escape(timestamp_utc)}</div>
-      <div><span class="badge">{escape(overall)}</span></div>
-    </div>
-    <table>
-      <thead>
-        <tr>
-          <th>Check</th>
-          <th>Status</th>
-          <th>Details</th>
-          <th>Evidence</th>
-        </tr>
-      </thead>
-      <tbody>
-        {''.join(rows)}
-      </tbody>
-    </table>
+  <div class="wrap">
+    <section class="hero">
+      <h1>Vault AMI Post-Upgrade Validation Report</h1>
+      <p>Environment: <strong>{escape(environment)}</strong> | Generated: <strong>{escape(timestamp_utc)}</strong></p>
+      <div class="overall">Overall Result: {escape(overall)}</div>
+    </section>
+
+    <section class="section">
+      <h2>Executive Summary</h2>
+      <div class="grid">
+        {''.join(summary_metrics)}
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Run Inputs</h2>
+      <div class="meta">
+        <div><strong>Environment</strong>{escape(environment)}</div>
+        <div><strong>Primary Token File</strong>{escape(str(metadata.get('primary_token_file', '')))}</div>
+        <div><strong>DR Token File</strong>{escape(str(metadata.get('dr_token_file', '')))}</div>
+        <div><strong>AWS Keys File</strong>{escape(str(metadata.get('aws_credentials_file', '')))}</div>
+        <div><strong>Primary Vault Address</strong>{escape(str(metadata.get('primary_vault_addr', '')))}</div>
+        <div><strong>DR Vault Address</strong>{escape(str(metadata.get('dr_vault_addr', '')))}</div>
+        <div><strong>Snapshot Bucket</strong>{escape(str(metadata.get('snapshot_bucket', '')))}</div>
+        <div><strong>Snapshot Prefix</strong>{escape(str(metadata.get('snapshot_prefix', '')))}</div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Detailed Validation Results</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Check</th>
+            <th>Status</th>
+            <th>Details</th>
+            <th>Evidence</th>
+            <th>Full Output</th>
+          </tr>
+        </thead>
+        <tbody>
+          {''.join(table_rows)}
+        </tbody>
+      </table>
+    </section>
   </div>
 </body>
 </html>
@@ -394,139 +644,119 @@ def save_html_report(path: Path, html: str) -> None:
     path.write_text(html, encoding="utf-8")
 
 
-def send_email_report(
-    smtp_host: str,
-    smtp_port: int,
-    sender: str,
-    recipients: List[str],
-    subject: str,
-    body: str,
-    attachment_path: Path,
-    use_tls: bool = True
-) -> None:
-    msg = EmailMessage()
-    msg["From"] = sender
-    msg["To"] = ", ".join(recipients)
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    mime_type, _ = mimetypes.guess_type(str(attachment_path))
-    if mime_type is None:
-        mime_type = "application/octet-stream"
-    maintype, subtype = mime_type.split("/", 1)
-
-    with attachment_path.open("rb") as handle:
-        msg.add_attachment(
-            handle.read(),
-            maintype=maintype,
-            subtype=subtype,
-            filename=attachment_path.name
-        )
-
-    with smtplib.SMTP(smtp_host, smtp_port) as smtp:
-        if use_tls:
-            smtp.starttls()
-        smtp.send_message(msg)
+def build_report_metadata(environment: str, env_config: Dict[str, Any], input_dir: Path, primary_token: str, dr_token: str) -> Dict[str, Any]:
+    return {
+        "environment": environment,
+        "primary_token_file": str(input_dir / "primary-token"),
+        "dr_token_file": str(input_dir / "dr-token"),
+        "aws_credentials_file": str(input_dir / "aws-keys"),
+        "primary_vault_addr": env_config["primary"]["vault_addr"],
+        "dr_vault_addr": env_config["dr"]["vault_addr"],
+        "snapshot_bucket": env_config["primary"]["snapshot_bucket"],
+        "snapshot_prefix": env_config["primary"].get("snapshot_prefix", "raft-snapshots/"),
+        "primary_token_masked": mask_secret(primary_token),
+        "dr_token_masked": mask_secret(dr_token),
+    }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Vault AMI validation runner")
-    parser.add_argument("--env", required=True, help="Environment name, e.g. le1 / xe1 / pe1")
-    parser.add_argument("--config", default="vault_validation_config.json", help="Path to config JSON")
-    parser.add_argument("--vault-token", default=None, help="Optional Vault token; otherwise use VAULT_TOKEN")
-    parser.add_argument("--output", default=None, help="Optional JSON output path")
-    parser.add_argument("--email-to", nargs="*", default=[], help="Email recipients")
-    parser.add_argument("--smtp-host", default=None, help="SMTP host")
-    parser.add_argument("--smtp-port", type=int, default=25, help="SMTP port")
-    parser.add_argument("--email-from", default=None, help="Sender email address")
-    parser.add_argument("--smtp-no-tls", action="store_true", help="Disable STARTTLS")
-    args = parser.parse_args()
+    print("\nVault AMI Post-Upgrade Validation\n")
+    environment = prompt_input("Environment (le1 / xe1 / pe1)")
 
-    config_path = Path(args.config)
-    if not config_path.exists():
-        print(f"Config file not found: {config_path}", file=sys.stderr)
-        return 2
-
-    with config_path.open("r", encoding="utf-8") as handle:
-        full_config = json.load(handle)
-
-    env_config = full_config["environments"].get(args.env)
-    if not env_config:
-        print(f"Environment '{args.env}' not found in config", file=sys.stderr)
-        return 2
-
-    vault_token = args.vault_token or env_config.get("vault_token")
-    base_env = dict(subprocess.os.environ)
-    results: List[CheckResult] = []
+    script_dir = Path(__file__).resolve().parent
+    config_path = script_dir / "vault_validation_config.json"
+    input_dir = script_dir / "inputs" / environment
+    report_dir = script_dir / "reports" / environment
+    report_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        primary_env = build_env(base_env, env_config["primary"]["vault_addr"], vault_token)
-        dr_env = build_env(base_env, env_config["dr"]["vault_addr"], vault_token)
+        if not config_path.exists():
+            raise ValidationError(f"Config file not found: {config_path}")
 
-        effective_token = vault_token or base_env.get("VAULT_TOKEN")
-        if not effective_token:
-            raise ValidationError("No Vault token found. Use --vault-token or set VAULT_TOKEN after vault login.")
+        full_config = json.loads(config_path.read_text(encoding="utf-8"))
+        env_config = full_config["environments"].get(environment)
+        if not env_config:
+            raise ValidationError(f"Environment '{environment}' not found in config")
 
-        results.append(check_vault_login(primary_env))
-        results.append(check_secret_rw(primary_env, env_config.get("kv_test_path", "kvtest/test")))
-        results.append(check_replication(args.env, env_config, primary_env))
-        results.append(check_unsealed_nodes("primary", env_config["primary"]["nodes"], effective_token))
-        results.append(check_unsealed_nodes("dr", env_config["dr"]["nodes"], effective_token))
-        results.append(check_raft_peers(primary_env, "primary"))
-        results.append(check_raft_peers(dr_env, "dr"))
-        results.append(check_snapshot_status(primary_env))
-        results.append(
-            check_s3_snapshot(
-                bucket=env_config["primary"]["snapshot_bucket"],
-                prefix=env_config["primary"].get("snapshot_prefix", "raft-snapshots/"),
-                aws_profile=env_config.get("aws_profile"),
-                aws_region=env_config.get("aws_region")
-            )
-        )
-        results.append(check_concourse(args.env, env_config))
+        primary_token = read_token_file(input_dir / "primary-token")
+        dr_token = read_token_file(input_dir / "dr-token")
+        aws_file_env = load_simple_env_file(input_dir / "aws-keys")
 
     except ValidationError as exc:
-        results.append(CheckResult(name="Execution", status="FAIL", details=str(exc)))
+        print(f"\nCritical setup failure: {exc}", file=sys.stderr)
+        return 2
 
-    summary = summarize(results)
-    print(summary)
+    results: List[CheckResult] = []
+    base_env = dict(subprocess.os.environ)
 
-    timestamp_utc = datetime.now(timezone.utc).isoformat()
+    primary_env = build_env(
+        base_env,
+        vault_addr=env_config["primary"]["vault_addr"],
+        vault_token=primary_token,
+        extra_env=aws_file_env,
+    )
+    dr_env = build_env(
+        base_env,
+        vault_addr=env_config["dr"]["vault_addr"],
+        vault_token=dr_token,
+        extra_env=aws_file_env,
+    )
+    aws_env = build_env(base_env, extra_env=aws_file_env)
+
+    safe_run_check(results, "Vault login (primary)", "Access", lambda: check_vault_login(primary_env, "primary"))
+    safe_run_check(results, "Vault login (dr)", "Access", lambda: check_vault_login(dr_env, "dr"))
+    safe_run_check(results, "Secret read/write", "Functional", lambda: check_secret_rw(primary_env, env_config.get("kv_test_path", "kvtest/test")))
+    safe_run_check(results, "Vault UI validation", "Functional", check_ui_manual)
+    safe_run_check(results, "DR primary replication status", "Replication", lambda: check_replication_primary(primary_env))
+    safe_run_check(results, "DR secondary replication status", "Replication", lambda: check_replication_secondary(dr_env))
+    safe_run_check(results, "Unsealed nodes (primary)", "Cluster Health", lambda: check_unsealed_nodes("primary", env_config["primary"]["nodes"], primary_token))
+    safe_run_check(results, "Unsealed nodes (dr)", "Cluster Health", lambda: check_unsealed_nodes("dr", env_config["dr"]["nodes"], dr_token))
+    safe_run_check(results, "Raft peers (primary)", "Raft", lambda: check_raft_peers(primary_env, "primary"))
+    safe_run_check(results, "Raft peers (dr)", "Raft", lambda: check_raft_peers(dr_env, "dr"))
+    safe_run_check(results, "Autopilot config (primary)", "Raft", lambda: check_autopilot_config(primary_env, "primary"))
+    safe_run_check(results, "Autopilot config (dr)", "Raft", lambda: check_autopilot_config(dr_env, "dr"))
+    safe_run_check(results, "Snapshot auto status", "Snapshots", lambda: check_snapshot_status(primary_env))
+    safe_run_check(
+        results,
+        "Latest S3 snapshot",
+        "Snapshots",
+        lambda: check_s3_snapshot(
+            bucket=env_config["primary"]["snapshot_bucket"],
+            prefix=env_config["primary"].get("snapshot_prefix", "raft-snapshots/"),
+            aws_env=aws_env,
+            aws_profile=env_config.get("aws_profile"),
+            aws_region=env_config.get("aws_region"),
+        ),
+    )
+    safe_run_check(results, "Daily maintenance pipeline", "Operations", lambda: check_concourse(environment, env_config))
+
+    overall = overall_status(results)
+    timestamp_utc = utc_now().isoformat()
+    metadata = build_report_metadata(environment, env_config, input_dir, primary_token, dr_token)
+
     report = {
-        "environment": args.env,
+        "environment": environment,
         "timestamp_utc": timestamp_utc,
-        "results": [result.__dict__ for result in results]
+        "overall_status": overall,
+        "metadata": metadata,
+        "results": [asdict(result) for result in results],
     }
 
-    json_path = Path(args.output) if args.output else Path(f"vault_validation_report_{args.env}_{utc_now_str()}.json")
-    with json_path.open("w", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2)
+    base_name = f"vault_validation_report_{environment}_{utc_now_str()}"
+    json_path = report_dir / f"{base_name}.json"
+    html_path = report_dir / f"{base_name}.html"
 
-    html_path = json_path.with_suffix(".html")
-    html = render_html_report(args.env, results, timestamp_utc)
-    save_html_report(html_path, html)
+    json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    save_html_report(html_path, render_html_report(environment, results, metadata, timestamp_utc))
+
+    print(f"\nOverall result: {overall}")
+    for result in results:
+        print(f"[{result.status}] {result.name}: {result.details}")
 
     print(f"\nJSON report saved to: {json_path}")
     print(f"HTML report saved to: {html_path}")
 
-    if args.email_to:
-        if not args.smtp_host or not args.email_from:
-            print("Email requested but --smtp-host or --email-from missing", file=sys.stderr)
-            return 2
-
-        send_email_report(
-            smtp_host=args.smtp_host,
-            smtp_port=args.smtp_port,
-            sender=args.email_from,
-            recipients=args.email_to,
-            subject=f"Vault AMI Validation Report - {args.env}",
-            body=f"Attached is the Vault AMI validation report for {args.env}.",
-            attachment_path=html_path,
-            use_tls=not args.smtp_no_tls
-        )
-        print(f"Email sent to: {', '.join(args.email_to)}")
-
-    return 1 if any(result.status == "FAIL" for result in results) else 0
+    return 1 if overall == "FAIL" else 0
 
 
 if __name__ == "__main__":
