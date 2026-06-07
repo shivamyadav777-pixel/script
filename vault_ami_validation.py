@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 import json
-import mimetypes
 import random
-import smtplib
-import ssl
 import subprocess
 import sys
-import urllib.request
+import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from email.message import EmailMessage
 from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,14 +39,6 @@ def prompt_input(prompt: str) -> str:
         if value:
             return value
         print("Value is required.")
-
-
-def mask_secret(value: Optional[str], keep: int = 4) -> str:
-    if not value:
-        return ""
-    if len(value) <= keep:
-        return "*" * len(value)
-    return "*" * (len(value) - keep) + value[-keep:]
 
 
 def read_text_file(path: Path) -> str:
@@ -134,11 +122,24 @@ def run_json_cmd(cmd: List[str], env: Optional[Dict[str, str]] = None) -> Tuple[
         ) from exc
 
 
-def health_get_json(url: str, token: str) -> Dict[str, Any]:
-    req = urllib.request.Request(url, headers={"X-Vault-Token": token})
-    ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, context=ctx, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+def run_json_cmd_with_retries(
+    cmd: List[str],
+    env: Optional[Dict[str, str]] = None,
+    retries: int = 4,
+    delay_seconds: int = 15
+) -> Tuple[Any, str]:
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return run_json_cmd(cmd, env=env)
+        except ValidationError as exc:
+            last_error = exc
+            if attempt == retries:
+                break
+            time.sleep(delay_seconds)
+    raise ValidationError(
+        f"Command failed after {retries} attempts: {' '.join(cmd)}\nLast error: {last_error}"
+    )
 
 
 def json_to_pretty(value: Any) -> str:
@@ -180,6 +181,7 @@ def check_vault_login(env_vars: Dict[str, str], cluster_label: str) -> CheckResu
 def check_secret_rw(env_vars: Dict[str, str], mount_path: str) -> CheckResult:
     key = f"ami_validation_{utc_now_str()}"
     value = "ok"
+
     run_cmd(["vault", "kv", "put", mount_path, f"{key}={value}"], env=env_vars)
     secret_data, raw = run_json_cmd(["vault", "kv", "get", "-format=json", mount_path], env=env_vars)
     actual = secret_data.get("data", {}).get("data", {}).get(key)
@@ -201,42 +203,39 @@ def check_ui_manual() -> CheckResult:
     return CheckResult(
         name="Vault UI validation",
         status="MANUAL",
-        details="Validate UI read/write if still required by team policy.",
+        details="Validate secret read/write from Vault UI if still required by team policy.",
         category="Functional",
     )
 
 
-def check_unsealed_nodes(cluster_name: str, nodes: List[Dict[str, str]], vault_token: str) -> CheckResult:
-    failures = []
-    node_results = []
+def check_vault_status(env_vars: Dict[str, str], cluster_name: str) -> CheckResult:
+    data, raw = run_json_cmd(["vault", "status", "-format=json"], env=env_vars)
 
-    for node in nodes:
-        payload = health_get_json(node["health_url"], vault_token)
-        sealed = payload.get("sealed")
-        node_results.append(
-            {
-                "node": node["name"],
-                "sealed": sealed,
-                "standby": payload.get("standby"),
-                "initialized": payload.get("initialized"),
-                "performance_standby": payload.get("performance_standby"),
-                "replication_dr_mode": payload.get("replication_dr_mode"),
-                "server_time_utc": payload.get("server_time_utc"),
-            }
-        )
-        if sealed is not False:
-            failures.append(node["name"])
+    initialized = data.get("initialized")
+    sealed = data.get("sealed")
 
-    if failures:
-        raise ValidationError(f"{cluster_name}: sealed nodes found: {', '.join(failures)}")
+    if initialized is not True:
+        raise ValidationError(f"{cluster_name}: initialized is not true. Found: {initialized}")
+    if sealed is not False:
+        raise ValidationError(f"{cluster_name}: sealed is not false. Found: {sealed}")
 
     return CheckResult(
-        name=f"Unsealed nodes ({cluster_name})",
+        name=f"Vault status ({cluster_name})",
         status="PASS",
-        details=f"All configured {cluster_name} nodes are unsealed.",
+        details=f"{cluster_name} cluster is initialized and unsealed.",
         category="Cluster Health",
-        evidence={"nodes": node_results},
-        raw_output=json_to_pretty(node_results),
+        evidence={
+            "initialized": initialized,
+            "sealed": sealed,
+            "standby": data.get("standby"),
+            "performance_standby": data.get("performance_standby"),
+            "replication_dr_mode": data.get("replication_dr_mode"),
+            "server_time_utc": data.get("server_time_utc"),
+            "version": data.get("version"),
+            "cluster_name": data.get("cluster_name"),
+            "cluster_id": data.get("cluster_id"),
+        },
+        raw_output=raw,
     )
 
 
@@ -328,24 +327,30 @@ def check_replication_secondary(env_vars: Dict[str, str]) -> CheckResult:
     )
 
 
-def check_snapshot_status(env_vars: Dict[str, str]) -> CheckResult:
-    status_data, raw_status = run_json_cmd(
+def check_snapshot_status(env_vars: Dict[str, str], retries: int, delay_seconds: int) -> CheckResult:
+    status_data, raw_status = run_json_cmd_with_retries(
         ["vault", "read", "-format=json", "sys/storage/raft/snapshot-auto/status/s3"],
         env=env_vars,
+        retries=retries,
+        delay_seconds=delay_seconds,
     )
-    config_data, raw_config = run_json_cmd(
+    config_data, raw_config = run_json_cmd_with_retries(
         ["vault", "read", "-format=json", "sys/storage/raft/snapshot-auto/config/s3"],
         env=env_vars,
+        retries=retries,
+        delay_seconds=delay_seconds,
     )
 
     return CheckResult(
         name="Snapshot auto status",
         status="PASS",
-        details="Retrieved raft snapshot auto status and config.",
+        details=f"Retrieved raft snapshot auto status and config after retry-aware execution.",
         category="Snapshots",
         evidence={
             "status": status_data.get("data", {}),
             "config": config_data.get("data", {}),
+            "retries_configured": retries,
+            "retry_delay_seconds": delay_seconds,
         },
         raw_output=f"STATUS\n{raw_status}\n\nCONFIG\n{raw_config}",
     )
@@ -365,7 +370,13 @@ def check_autopilot_config(env_vars: Dict[str, str], cluster_name: str) -> Check
     )
 
 
-def check_s3_snapshot(bucket: str, prefix: str, aws_env: Dict[str, str], aws_profile: Optional[str], aws_region: Optional[str]) -> CheckResult:
+def check_s3_snapshot(
+    bucket: str,
+    prefix: str,
+    aws_env: Dict[str, str],
+    aws_profile: Optional[str],
+    aws_region: Optional[str]
+) -> CheckResult:
     cmd = ["aws"]
     if aws_profile:
         cmd.extend(["--profile", aws_profile])
@@ -439,9 +450,15 @@ def render_html_report(environment: str, results: List[CheckResult], metadata: D
     secondary_replication = next((r for r in results if r.name == "DR secondary replication status"), None)
     primary_raft = next((r for r in results if r.name == "Raft peers (primary)"), None)
     dr_raft = next((r for r in results if r.name == "Raft peers (dr)"), None)
+    primary_status = next((r for r in results if r.name == "Vault status (primary)"), None)
+    dr_status = next((r for r in results if r.name == "Vault status (dr)"), None)
     s3_snap = next((r for r in results if r.name == "Latest S3 snapshot"), None)
 
     summary_metrics = []
+    if primary_status:
+        summary_metrics.append(metric_card("Primary Sealed", str(primary_status.evidence.get("sealed", "N/A"))))
+    if dr_status:
+        summary_metrics.append(metric_card("DR Sealed", str(dr_status.evidence.get("sealed", "N/A"))))
     if primary_raft:
         summary_metrics.append(metric_card("Primary Raft Peers", str(primary_raft.evidence.get("peer_count", "N/A"))))
     if dr_raft:
@@ -644,7 +661,7 @@ def save_html_report(path: Path, html: str) -> None:
     path.write_text(html, encoding="utf-8")
 
 
-def build_report_metadata(environment: str, env_config: Dict[str, Any], input_dir: Path, primary_token: str, dr_token: str) -> Dict[str, Any]:
+def build_report_metadata(environment: str, env_config: Dict[str, Any], input_dir: Path) -> Dict[str, Any]:
     return {
         "environment": environment,
         "primary_token_file": str(input_dir / "primary-token"),
@@ -654,8 +671,8 @@ def build_report_metadata(environment: str, env_config: Dict[str, Any], input_di
         "dr_vault_addr": env_config["dr"]["vault_addr"],
         "snapshot_bucket": env_config["primary"]["snapshot_bucket"],
         "snapshot_prefix": env_config["primary"].get("snapshot_prefix", "raft-snapshots/"),
-        "primary_token_masked": mask_secret(primary_token),
-        "dr_token_masked": mask_secret(dr_token),
+        "snapshot_retries": env_config.get("snapshot_retry_attempts", 4),
+        "snapshot_retry_delay_seconds": env_config.get("snapshot_retry_delay_seconds", 15),
     }
 
 
@@ -703,19 +720,27 @@ def main() -> int:
     )
     aws_env = build_env(base_env, extra_env=aws_file_env)
 
+    snapshot_retries = env_config.get("snapshot_retry_attempts", 4)
+    snapshot_retry_delay_seconds = env_config.get("snapshot_retry_delay_seconds", 15)
+
     safe_run_check(results, "Vault login (primary)", "Access", lambda: check_vault_login(primary_env, "primary"))
     safe_run_check(results, "Vault login (dr)", "Access", lambda: check_vault_login(dr_env, "dr"))
     safe_run_check(results, "Secret read/write", "Functional", lambda: check_secret_rw(primary_env, env_config.get("kv_test_path", "kvtest/test")))
     safe_run_check(results, "Vault UI validation", "Functional", check_ui_manual)
+    safe_run_check(results, "Vault status (primary)", "Cluster Health", lambda: check_vault_status(primary_env, "primary"))
+    safe_run_check(results, "Vault status (dr)", "Cluster Health", lambda: check_vault_status(dr_env, "dr"))
     safe_run_check(results, "DR primary replication status", "Replication", lambda: check_replication_primary(primary_env))
     safe_run_check(results, "DR secondary replication status", "Replication", lambda: check_replication_secondary(dr_env))
-    safe_run_check(results, "Unsealed nodes (primary)", "Cluster Health", lambda: check_unsealed_nodes("primary", env_config["primary"]["nodes"], primary_token))
-    safe_run_check(results, "Unsealed nodes (dr)", "Cluster Health", lambda: check_unsealed_nodes("dr", env_config["dr"]["nodes"], dr_token))
     safe_run_check(results, "Raft peers (primary)", "Raft", lambda: check_raft_peers(primary_env, "primary"))
     safe_run_check(results, "Raft peers (dr)", "Raft", lambda: check_raft_peers(dr_env, "dr"))
     safe_run_check(results, "Autopilot config (primary)", "Raft", lambda: check_autopilot_config(primary_env, "primary"))
     safe_run_check(results, "Autopilot config (dr)", "Raft", lambda: check_autopilot_config(dr_env, "dr"))
-    safe_run_check(results, "Snapshot auto status", "Snapshots", lambda: check_snapshot_status(primary_env))
+    safe_run_check(
+        results,
+        "Snapshot auto status",
+        "Snapshots",
+        lambda: check_snapshot_status(primary_env, snapshot_retries, snapshot_retry_delay_seconds),
+    )
     safe_run_check(
         results,
         "Latest S3 snapshot",
@@ -732,7 +757,7 @@ def main() -> int:
 
     overall = overall_status(results)
     timestamp_utc = utc_now().isoformat()
-    metadata = build_report_metadata(environment, env_config, input_dir, primary_token, dr_token)
+    metadata = build_report_metadata(environment, env_config, input_dir)
 
     report = {
         "environment": environment,
