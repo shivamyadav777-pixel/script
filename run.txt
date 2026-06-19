@@ -151,6 +151,16 @@ def overall_status(results):
     return "PASS"
 
 
+def display_status(status):
+    mapping = {
+        "PASS": "Pass",
+        "FAIL": "Fail",
+        "PARTIAL": "Pending Manual Validation",
+        "MANUAL": "Manual Validation Required",
+    }
+    return mapping.get(status, status)
+
+
 def safe_run_check(results, name, category, fn):
     try:
         results.append(fn())
@@ -262,6 +272,44 @@ def check_raft_peers(env_vars, cluster_name, expected_total=5):
         "Raft peers ({0})".format(cluster_name),
         "PASS",
         "{0} has {1} peers with 1 leader and {2} followers.".format(cluster_name, total, len(followers)),
+        "Raft",
+        {
+            "peer_count": total,
+            "leader_count": len(leaders),
+            "follower_count": len(followers),
+            "servers": peers,
+        }
+    )
+
+
+def check_raft_peers_dr(vault_addr, dr_token, expected_total=5):
+    cmd = [
+        "vault",
+        "operator",
+        "raft",
+        "list-peers",
+        "-format=json",
+        "-dr-token={0}".format(dr_token)
+    ]
+    env_vars = build_env(dict(subprocess.os.environ), vault_addr=vault_addr)
+    data = run_json_cmd(cmd, env=env_vars)
+
+    peers = data.get("data", {}).get("config", {}).get("servers", [])
+    total = len(peers)
+    leaders = [peer for peer in peers if peer.get("leader") is True]
+    followers = [peer for peer in peers if peer.get("leader") is not True]
+
+    if total != expected_total:
+        raise ValidationError("dr: expected {0} raft peers, found {1}".format(expected_total, total))
+    if len(leaders) != 1:
+        raise ValidationError("dr: expected 1 leader, found {0}".format(len(leaders)))
+    if len(followers) != expected_total - 1:
+        raise ValidationError("dr: expected {0} followers, found {1}".format(expected_total - 1, len(followers)))
+
+    return CheckResult(
+        "Raft peers (dr)",
+        "PASS",
+        "dr has {0} peers with 1 leader and {1} followers.".format(total, len(followers)),
         "Raft",
         {
             "peer_count": total,
@@ -452,7 +500,7 @@ def render_html_report(environment, results, metadata, timestamp_utc):
     snapshot = find_result(results, "Latest S3 snapshot")
 
     summary_metrics = [
-        metric_card("Overall Status", overall),
+        metric_card("Overall Status", display_status(overall)),
         metric_card("Primary Initialized", primary_status.evidence.get("initialized") if primary_status else None),
         metric_card("Primary Sealed", primary_status.evidence.get("sealed") if primary_status else None),
         metric_card("DR Initialized", dr_status.evidence.get("initialized") if dr_status else None),
@@ -497,7 +545,7 @@ def render_html_report(environment, results, metadata, timestamp_utc):
             escape(result.category),
             escape(result.name),
             status_color(result.status),
-            escape(result.status),
+            escape(display_status(result.status)),
             escape(result.details),
             escape(evidence_json)
         ))
@@ -522,7 +570,7 @@ def render_html_report(environment, results, metadata, timestamp_utc):
       <div class="panel-item"><span>Last WAL</span><strong>{4}</strong></div>
     </div>
     """.format(
-        escape(overall if primary_status else "N/A"),
+        escape(display_status(primary_status.status) if primary_status else "N/A"),
         escape(str(primary_status.evidence.get("initialized")) if primary_status else "N/A"),
         escape(str(primary_status.evidence.get("sealed")) if primary_status else "N/A"),
         escape(str(primary_raft.evidence.get("peer_count")) if primary_raft else "N/A"),
@@ -539,7 +587,7 @@ def render_html_report(environment, results, metadata, timestamp_utc):
       <div class="panel-item"><span>Last Remote WAL</span><strong>{4}</strong></div>
     </div>
     """.format(
-        escape(overall if dr_status else "N/A"),
+        escape(display_status(dr_status.status) if dr_status else "N/A"),
         escape(str(dr_status.evidence.get("initialized")) if dr_status else "N/A"),
         escape(str(dr_status.evidence.get("sealed")) if dr_status else "N/A"),
         escape(str(dr_raft.evidence.get("peer_count")) if dr_raft else "N/A"),
@@ -800,7 +848,7 @@ def render_html_report(environment, results, metadata, timestamp_utc):
         escape(environment),
         status_color(overall),
         escape(timestamp_utc),
-        escape(overall),
+        escape(display_status(overall)),
         "".join(summary_metrics),
         primary_panel,
         dr_panel,
@@ -884,7 +932,7 @@ def main():
     safe_run_check(results, "DR primary replication status", "Replication", lambda: check_replication_primary(primary_env))
     safe_run_check(results, "DR secondary replication status", "Replication", lambda: check_replication_secondary(dr_env))
     safe_run_check(results, "Raft peers (primary)", "Raft", lambda: check_raft_peers(primary_env, "primary"))
-    safe_run_check(results, "Raft peers (dr)", "Raft", lambda: check_raft_peers(dr_env, "dr"))
+    safe_run_check(results, "Raft peers (dr)", "Raft", lambda: check_raft_peers_dr(env_config["dr"]["vault_addr"], dr_token))
     safe_run_check(results, "Autopilot config (primary)", "Raft", lambda: check_autopilot_config(primary_env, "primary"))
     safe_run_check(results, "Autopilot config (dr)", "Raft", lambda: check_autopilot_config(dr_env, "dr"))
     safe_run_check(
@@ -926,9 +974,9 @@ def main():
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     save_html_report(html_path, render_html_report(environment, results, metadata, timestamp_utc))
 
-    print("\nOverall result: {0}".format(overall))
+    print("\nOverall result: {0}".format(display_status(overall)))
     for result in results:
-        print("[{0}] {1}: {2}".format(result.status, result.name, result.details))
+        print("[{0}] {1}: {2}".format(display_status(result.status), result.name, result.details))
 
     print("\nJSON report saved to: {0}".format(json_path))
     print("HTML report saved to: {0}".format(html_path))
