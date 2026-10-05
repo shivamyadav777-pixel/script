@@ -489,10 +489,11 @@ def find_raft_servers(value):
             matching = []
 
             for item in value:
-                if "state" in item and (
-                    "voter" in item or
-                    "node_id" in item or
-                    "id" in item
+                if (
+                    "node_id" in item and
+                    "address" in item and
+                    "leader" in item and
+                    "voter" in item
                 ):
                     matching.append(item)
 
@@ -530,16 +531,16 @@ def check_raft_peers(runner, environment, dr_token=None):
     payload = runner.run_json(command, environment)
     servers = find_raft_servers(extract_data(payload))
 
-    expect(bool(servers), "Raft output did not contain a peer list.")
+    expect(bool(servers), "Raft JSON output did not contain servers.")
 
     leaders = [
         item for item in servers
-        if str(item.get("state", "")).lower() == "leader"
+        if as_bool(item.get("leader"))
     ]
 
     followers = [
         item for item in servers
-        if str(item.get("state", "")).lower() == "follower"
+        if not as_bool(item.get("leader"))
     ]
 
     voters = [
@@ -547,12 +548,27 @@ def check_raft_peers(runner, environment, dr_token=None):
         if as_bool(item.get("voter"))
     ]
 
-    expect(len(servers) == 5, "Expected 5 Raft peers; found {0}.".format(
-        len(servers)
-    ))
-    expect(len(leaders) == 1, "Expected 1 Raft leader.")
-    expect(len(followers) == 4, "Expected 4 Raft followers.")
-    expect(len(voters) == 5, "Expected 5 Raft voters.")
+    expect(
+        len(servers) == 5,
+        "Expected 5 Raft peers; found {0}.".format(len(servers))
+    )
+
+    expect(
+        len(leaders) == 1,
+        "Expected 1 Raft leader; found {0}.".format(len(leaders))
+    )
+
+    expect(
+        len(followers) == 4,
+        "Expected 4 Raft followers; found {0}.".format(len(followers))
+    )
+
+    expect(
+        len(voters) == 5,
+        "Expected all 5 Raft peers to be voters; found {0}.".format(
+            len(voters)
+        )
+    )
 
     return evidence(payload, {
         "peer_count": len(servers),
@@ -560,7 +576,6 @@ def check_raft_peers(runner, environment, dr_token=None):
         "follower_count": len(followers),
         "voter_count": len(voters)
     })
-
 
 def check_autopilot(runner, environment, dr_token=None):
     command = [
