@@ -595,19 +595,32 @@ def check_autopilot(runner, environment, dr_token=None):
 
 
 def check_secret_write(runner, context):
-    payload = runner.run_json(
-        [
-            "vault",
-            "write",
-            "-format=json",
-            context["secret_path"],
-            "Test=success"
-        ],
-        context["primary_env"]
-    )
+    command = [
+        "vault",
+        "write",
+        "-format=json",
+        context["secret_path"],
+        "Test=success"
+    ]
 
-    return evidence(payload, {
-        "validation_path": context["secret_path"]
+    output = runner.run(command, context["primary_env"])
+
+    if output.strip():
+        try:
+            command_output = json.loads(output)
+        except ValueError:
+            command_output = {
+                "message": "Vault accepted the write request.",
+                "raw_response": output.strip()
+            }
+    else:
+        command_output = {
+            "message": "Vault accepted the write request."
+        }
+
+    return evidence(command_output, {
+        "validation_path": context["secret_path"],
+        "write_command_completed": True
     })
 
 
