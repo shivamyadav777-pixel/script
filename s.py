@@ -1085,29 +1085,31 @@ def check_recovery(runner, environment):
     shares = find_first(payload, [
         "recovery_seal_shares",
         "total_recovery_shares",
-        "recovery_shares"
+        "recovery_shares",
+        "n"
     ])
 
     threshold = find_first(payload, [
         "recovery_seal_threshold",
-        "recovery_threshold"
+        "recovery_threshold",
+        "t"
     ])
 
     expect(
         shares is not None,
-        "Total Recovery Shares was not found in vault status."
+        "Total Recovery Shares was not found in vault status JSON."
     )
 
     expect(
         threshold is not None,
-        "Recovery Threshold was not found in vault status."
+        "Recovery Threshold was not found in vault status JSON."
     )
 
     return evidence(payload, {
+        "source": "vault status -format=json",
         "total_recovery_shares": shares,
         "recovery_threshold": threshold
     })
-
 
 def check_tls(address):
     parsed = urlparse(address)
