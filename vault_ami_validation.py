@@ -1,2309 +1,1538 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+# vault_ami_validation.py
+# Python 3.5 compatible. Run inside approved Dojo only.
+
 from __future__ import print_function
 
+import datetime
+import getpass
+import html
 import json
 import os
-import random
 import re
-import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import time
-from datetime import datetime
-from getpass import getpass
-from html import escape
-from pathlib import Path
 from string import Template
 from urllib.parse import urlparse
 
 
-DEFAULT_COMMAND_TIMEOUT = 90
-PRIMARY_SCOPE = "Primary"
-DR_SCOPE = "DR"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "vault_validation_config.json")
+REPORT_DIR = os.path.join(BASE_DIR, "reports")
 
 
 class ValidationError(Exception):
     pass
 
 
-class CheckResult(object):
-    def __init__(self, name, status, details, category="General", evidence=None):
-        self.name = name
-        self.status = status
-        self.details = details
-        self.category = category
-        self.evidence = evidence or {}
-        self.scope = ""
-        self.duration_seconds = 0
-
-    def to_dict(self):
-        return {
-            "name": self.name,
-            "status": self.status,
-            "details": self.details,
-            "category": self.category,
-            "scope": self.scope,
-            "duration_seconds": self.duration_seconds,
-            "evidence": self.evidence
-        }
+class CommandError(Exception):
+    pass
 
 
-class CommandRunner(object):
-    def __init__(self, transcript_path, timeout_seconds):
-        self.transcript_path = transcript_path
-        self.timeout_seconds = timeout_seconds
-        self.handle = transcript_path.open("w", encoding="utf-8")
+class Result(object):
+    def __init__(self, section, title, command, condition, steps,
+                 counts_only=False):
+        self.section = section
+        self.title = title
+        self.command = command
+        self.condition = condition
+        self.steps = steps
+        self.counts_only = counts_only
+        self.outcome = "review"
+        self.evidence = None
+        self.error = ""
 
-    def close(self):
-        if not self.handle.closed:
-            self.handle.close()
 
-    def redact_command(self, command):
-        safe_parts = []
+def clean_error(value):
+    text = str(value or "").strip()
+    return re.sub(
+        r"(?i)(token|password|secret|access_key)[=:][^\s,;]+",
+        r"\1=***",
+        text
+    )[:800]
 
-        for item in command:
-            if item.startswith("-dr-token="):
-                safe_parts.append("-dr-token=REDACTED")
-            else:
-                safe_parts.append(item)
 
-        return " ".join(safe_parts)
+def display_command(command):
+    output = []
 
-    def record_output(self, command, stdout, stderr):
-        output = "\n" + ("=" * 100) + "\n"
-        output += "COMMAND: {0}\n".format(self.redact_command(command))
-        output += ("-" * 100) + "\n"
-        output += "STDOUT:\n{0}\n".format(stdout.strip() or "No output")
+    for value in command:
+        value = str(value)
 
-        if stderr.strip():
-            output += "\nSTDERR:\n{0}\n".format(stderr.strip())
+        if value.startswith("-dr-token="):
+            value = "-dr-token=***"
 
-        self.handle.write(output)
-        self.handle.flush()
-        print(output)
+        output.append(value)
 
-    def run(self, command, env=None, check=True, timeout_seconds=None, input_text=None):
-        timeout = timeout_seconds or self.timeout_seconds
+    return " ".join(output)
+
+
+class Runner(object):
+    def run(self, command, env, allowed_codes=None, timeout=60):
+        if allowed_codes is None:
+            allowed_codes = [0]
+
+        command_env = os.environ.copy()
+        command_env.update(env)
+        command_env["VAULT_FORMAT"] = "json"
+        command_env["VAULT_CLI_NO_COLOR"] = "1"
 
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True,
-                input=input_text,
-                env=env,
-                shell=False,
-                timeout=timeout
+                env=command_env
             )
+            stdout, stderr = process.communicate(timeout=timeout)
+
+        except OSError as exc:
+            raise ValidationError(
+                "Unable to start {0}: {1}".format(
+                    display_command(command), exc
+                )
+            )
+
         except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
             raise ValidationError(
-                "Command timed out after {0} seconds: {1}".format(
-                    timeout,
-                    self.redact_command(command)
+                "Command timed out: {0}".format(display_command(command))
+            )
+
+        if not isinstance(stdout, str):
+            stdout = stdout.decode("utf-8", "replace")
+
+        if not isinstance(stderr, str):
+            stderr = stderr.decode("utf-8", "replace")
+
+        if process.returncode not in allowed_codes:
+            raise CommandError(
+                "{0} - {1}".format(
+                    display_command(command),
+                    clean_error(stderr)
                 )
             )
 
-        self.record_output(command, result.stdout, result.stderr)
+        return stdout
 
-        if check and result.returncode != 0:
-            raise ValidationError(
-                "Command failed with exit code {0}: {1}".format(
-                    result.returncode,
-                    self.redact_command(command)
-                )
-            )
-
-        return result
-
-    def run_json(self, command, env=None, check=True, timeout_seconds=None):
-        result = self.run(
-            command,
-            env=env,
-            check=check,
-            timeout_seconds=timeout_seconds
-        )
-
-        try:
-            return json.loads(result.stdout.strip()), result.returncode
-        except ValueError:
-            raise ValidationError(
-                "Command did not return valid JSON: {0}".format(
-                    self.redact_command(command)
-                )
-            )
-
-    def run_json_with_retries(
-        self,
-        command,
-        env=None,
-        retries=4,
-        delay_seconds=15,
-        timeout_seconds=None
-    ):
+    def json(self, command, env, allowed_codes=None, retries=1):
         last_error = None
 
-        for attempt in range(1, retries + 1):
+        for attempt in range(retries):
             try:
-                result, _ = self.run_json(
-                    command,
-                    env=env,
-                    timeout_seconds=timeout_seconds
+                return json.loads(
+                    self.run(command, env, allowed_codes=allowed_codes)
                 )
-                return result
-            except ValidationError as exc:
+            except (ValueError, ValidationError, CommandError) as exc:
                 last_error = exc
 
-                if attempt < retries:
-                    print(
-                        "Retrying in {0} seconds. Attempt {1} of {2}.".format(
-                            delay_seconds,
-                            attempt + 1,
-                            retries
-                        )
-                    )
-                    time.sleep(delay_seconds)
+                if attempt + 1 < retries:
+                    time.sleep(5)
 
-        raise ValidationError(
-            "Command failed after {0} attempts. Last error: {1}".format(
-                retries,
-                last_error
+        if isinstance(last_error, ValueError):
+            raise ValidationError(
+                "Expected JSON output from {0}.".format(
+                    display_command(command)
+                )
             )
-        )
+
+        raise last_error
 
 
-def utc_now():
-    return datetime.utcnow()
-
-
-def utc_now_str():
-    return utc_now().strftime("%Y%m%d%H%M%S")
-
-
-def prompt_input(prompt):
+def choose(title, values):
     while True:
-        value = input(prompt + ": ").strip()
-        if value:
-            return value
-        print("Value is required.")
+        print("\n{0}".format(title))
 
-
-def prompt_secret(prompt):
-    while True:
-        value = getpass(prompt + ": ").strip()
-        if value:
-            return value
-        print("Value is required.")
-
-
-def prompt_optional_secret(prompt):
-    return getpass(prompt + " (leave blank if not applicable): ").strip()
-
-
-def prompt_menu(title, options):
-    print("\n" + title)
-
-    for index, option in enumerate(options, 1):
-        print("{0}. {1}".format(index, option))
-
-    while True:
-        selected = input("Select an option: ").strip()
+        for number, value in enumerate(values, 1):
+            print("  {0}. {1}".format(number, value))
 
         try:
-            selected_number = int(selected)
-            if 1 <= selected_number <= len(options):
-                return selected_number
+            selected = int(input("Choose an option: ").strip())
+            if 1 <= selected <= len(values):
+                return selected - 1
         except ValueError:
             pass
 
-        print(
-            "Invalid selection. Enter a number between 1 and {0}.".format(
-                len(options)
-            )
-        )
+        print("Enter a valid menu number.")
 
 
-def prompt_environment(config):
-    environments = sorted(config.get("environments", {}).keys())
+def required_secret(label):
+    for unused_attempt in range(3):
+        value = getpass.getpass(label).strip()
+        if value:
+            return value
+        print("A value is required.")
 
-    if not environments:
-        raise ValidationError("No environments were found in the config file.")
+    raise ValidationError("Required input was not supplied.")
 
-    print("\nAvailable environments:")
-    for index, environment in enumerate(environments, 1):
-        print("{0}. {1}".format(index, environment))
+
+def get_label():
+    selected = choose(
+        "Validation type",
+        ["Precheck", "Postcheck", "Custom label"]
+    )
+
+    if selected == 0:
+        return "precheck"
+
+    if selected == 1:
+        return "postcheck"
 
     while True:
-        selected = input("\nSelect environment: ").strip()
+        label = input(
+            "Enter label (letters, numbers, hyphens, underscores): "
+        ).strip()
 
-        if selected in environments:
-            return selected
+        if re.match(r"^[A-Za-z0-9_-]{1,40}$", label):
+            return label.lower()
 
-        try:
-            selected_number = int(selected)
-            if 1 <= selected_number <= len(environments):
-                return environments[selected_number - 1]
-        except ValueError:
-            pass
-
-        print("Enter a valid environment name or menu number.")
+        print("Invalid label.")
 
 
-def prompt_validation_label():
-    selected = prompt_menu(
-        "Validation Type",
+def aws_options():
+    selected = choose(
+        "AWS S3 snapshot validation",
         [
-            "Precheck",
-            "Postcheck",
-            "Custom validation label"
+            "Use existing AWS credentials in Dojo",
+            "Enter temporary AWS credentials",
+            "Skip AWS credential-dependent checks"
         ]
     )
 
-    if selected == 1:
-        return "precheck"
+    if selected == 0:
+        return True, {}, ""
 
     if selected == 2:
-        return "postcheck"
+        return False, {}, "AWS credentials were intentionally skipped."
 
-    label = prompt_input("Custom validation label")
-    label = re.sub(r"[^A-Za-z0-9_-]", "-", label).strip("-")
+    environment = {
+        "AWS_ACCESS_KEY_ID": required_secret("AWS access key ID: "),
+        "AWS_SECRET_ACCESS_KEY": required_secret(
+            "AWS secret access key: "
+        )
+    }
 
-    if not label:
-        raise ValidationError("Custom validation label is invalid.")
+    token = getpass.getpass(
+        "AWS session token (Enter if not applicable): "
+    ).strip()
 
-    return label
+    if token:
+        environment["AWS_SESSION_TOKEN"] = token
+
+    return True, environment, ""
 
 
-def require_command(command_name):
-    if shutil.which(command_name) is None:
+def get_context():
+    if not os.path.isfile(CONFIG_FILE):
         raise ValidationError(
-            "Required command not found in PATH: {0}".format(command_name)
+            "Configuration file not found: {0}".format(CONFIG_FILE)
         )
 
+    with open(CONFIG_FILE, "r") as input_file:
+        config = json.load(input_file)
 
-def build_env(base_env, vault_addr=None, vault_token=None, extra_env=None):
-    values = dict(base_env)
+    names = sorted(config["environments"].keys())
+    name = names[choose("Select Vault environment", names)]
+    profile = config["environments"][name]
 
-    if extra_env:
-        values.update(extra_env)
+    for key in ["primary_addr", "dr_addr", "test_secret_prefix"]:
+        value = str(profile.get(key, "")).strip()
 
-    values["VAULT_FORMAT"] = "json"
-    values["VAULT_CLIENT_TIMEOUT"] = "120"
+        if not value or "VAULT-ADDRESS" in value:
+            raise ValidationError(
+                "Set {0} for {1} in vault_validation_config.json.".format(
+                    key, name
+                )
+            )
 
-    if vault_addr:
-        values["VAULT_ADDR"] = vault_addr
+    label = get_label()
 
-    if vault_token:
-        values["VAULT_TOKEN"] = vault_token
+    print("\nTokens remain in memory only and are not saved.")
+    primary_token = required_secret("Primary Vault token: ")
+    dr_token = required_secret("DR operation token: ")
 
-    return values
+    aws_enabled = False
+    aws_env = {}
+    aws_skip_reason = ""
 
+    if profile.get("provider") == "aws":
+        aws_enabled, aws_env, aws_skip_reason = aws_options()
 
-def collect_runtime_credentials(cloud, base_env):
-    print("\nCredential Setup")
-    print("-" * 48)
-    print("Vault tokens are entered securely and are never saved to disk.")
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    test_path = "{0}/{1}-{2}-{3}".format(
+        profile["test_secret_prefix"].strip("/"),
+        datetime.datetime.utcnow().strftime("%Y%m%d"),
+        label,
+        timestamp
+    )
 
-    primary_token = prompt_secret("Primary Vault admin token")
-    dr_token = prompt_secret("DR operation token")
+    primary_env = {
+        "VAULT_ADDR": profile["primary_addr"],
+        "VAULT_TOKEN": primary_token
+    }
 
-    aws_env = dict(base_env)
-    gcp_env = dict(base_env)
+    dr_env = {
+        "VAULT_ADDR": profile["dr_addr"],
+        "VAULT_TOKEN": dr_token
+    }
 
-    if cloud == "aws":
-        selected = prompt_menu(
-            "AWS Credential Source",
-            [
-                "Use existing Dojo / AWS CLI credentials",
-                "Enter temporary AWS session credentials"
-            ]
-        )
-
-        if selected == 2:
-            aws_access_key = prompt_secret("AWS access key ID")
-            aws_secret_key = prompt_secret("AWS secret access key")
-            aws_session_token = prompt_optional_secret("AWS session token")
-
-            aws_env["AWS_ACCESS_KEY_ID"] = aws_access_key
-            aws_env["AWS_SECRET_ACCESS_KEY"] = aws_secret_key
-
-            if aws_session_token:
-                aws_env["AWS_SESSION_TOKEN"] = aws_session_token
-
-    if cloud == "gcp":
-        print(
-            "\nGCP validation uses the active Dojo gsutil/gcloud identity. "
-            "Authenticate to GCP before running this script."
-        )
+    primary_env.update(aws_env)
+    dr_env.update(aws_env)
 
     return {
-        "primary_token": primary_token,
+        "environment": name,
+        "profile": profile,
+        "label": label,
+        "timestamp": timestamp,
+        "test_path": test_path,
+        "primary_env": primary_env,
+        "dr_env": dr_env,
         "dr_token": dr_token,
-        "aws_env": aws_env,
-        "gcp_env": gcp_env
+        "aws_enabled": aws_enabled,
+        "aws_skip_reason": aws_skip_reason,
+        "manual_items": []
     }
 
 
-def extract_data(payload):
-    if isinstance(payload, dict):
-        return payload.get("data", payload)
-    return payload
+def expect(condition, message):
+    if not condition:
+        raise ValidationError(message)
 
 
-def safe_int(value):
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return None
+def as_bool(value):
+    return value is True or str(value).lower() == "true"
 
 
-def parse_iso_datetime(value):
+def extract_data(value):
+    if isinstance(value, dict) and isinstance(value.get("data"), (dict, list)):
+        return value["data"]
+
+    return value
+
+
+def find_first(value, names):
+    names = set([name.lower() for name in names])
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() in names and item not in (None, ""):
+                return item
+
+        for item in value.values():
+            found = find_first(item, names)
+            if found not in (None, ""):
+                return found
+
+    if isinstance(value, list):
+        for item in value:
+            found = find_first(item, names)
+            if found not in (None, ""):
+                return found
+
+    return None
+
+
+def all_values(value, names):
+    names = set([name.lower() for name in names])
+    output = []
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() in names:
+                output.append(item)
+            output.extend(all_values(item, names))
+
+    elif isinstance(value, list):
+        for item in value:
+            output.extend(all_values(item, names))
+
+    return output
+
+
+def parse_time(value):
     if not value:
         return None
 
-    clean = str(value).strip()
+    text = str(value).replace("Z", "+0000")
+    text = re.sub(r"([+-]\d\d):(\d\d)$", r"\1\2", text)
 
-    if clean.endswith("Z"):
-        clean = clean[:-1]
-
-    if "+" in clean:
-        clean = clean.split("+")[0]
-
-    for date_format in [
+    for item_format in [
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%dT%H:%M:%S.%f",
         "%Y-%m-%dT%H:%M:%S"
     ]:
         try:
-            return datetime.strptime(clean, date_format)
+            value = datetime.datetime.strptime(text, item_format)
+
+            if value.tzinfo is None:
+                return value.replace(tzinfo=datetime.timezone.utc)
+
+            return value.astimezone(datetime.timezone.utc)
+
         except ValueError:
             pass
 
     return None
 
 
-def parse_openssl_datetime(value):
-    try:
-        return datetime.strptime(value.strip(), "%b %d %H:%M:%S %Y %Z")
-    except ValueError:
-        return None
+def make_evidence(output, assessment=None):
+    data = {"command_output": output}
+
+    if assessment:
+        data["assessment"] = assessment
+
+    return data
 
 
-def status_color(status):
-    colors = {
-        "PASS": "#15803d",
-        "FAIL": "#c2410c",
-        "PARTIAL": "#b45309",
-        "MANUAL": "#0369a1"
-    }
-    return colors.get(status, "#475569")
-
-
-def display_status(status):
-    values = {
-        "PASS": "Pass",
-        "FAIL": "Fail",
-        "PARTIAL": "Pending Manual Validation",
-        "MANUAL": "Manual Validation Required"
-    }
-    return values.get(status, status)
-
-
-def overall_status(results):
-    if any(item.status == "FAIL" for item in results):
-        return "FAIL"
-
-    if any(item.status == "MANUAL" for item in results):
-        return "PARTIAL"
-
-    return "PASS"
-
-
-def find_result(results, name, scope=None):
-    for item in results:
-        if item.name == name and (scope is None or item.scope == scope):
-            return item
-    return None
-
-
-def score(results, scope):
-    scoped_results = [item for item in results if item.scope == scope]
-
-    return {
-        "total": len(scoped_results),
-        "passed": len([
-            item for item in scoped_results
-            if item.status == "PASS"
-        ]),
-        "failed": len([
-            item for item in scoped_results
-            if item.status == "FAIL"
-        ]),
-        "manual": len([
-            item for item in scoped_results
-            if item.status == "MANUAL"
-        ])
-    }
-
-
-def safe_run_check(results, scope, name, category, function):
-    started = time.time()
-
-    try:
-        result = function()
-        result.scope = scope
-        result.duration_seconds = round(time.time() - started, 2)
-        results.append(result)
-    except ValidationError as exc:
-        result = CheckResult(name, "FAIL", str(exc), category)
-        result.scope = scope
-        result.duration_seconds = round(time.time() - started, 2)
-        results.append(result)
-    except Exception as exc:
-        result = CheckResult(
-            name,
-            "FAIL",
-            "Unexpected error: {0}".format(exc),
-            category
-        )
-        result.scope = scope
-        result.duration_seconds = round(time.time() - started, 2)
-        results.append(result)
-
-
-def get_snapshot_config(environment_config):
-    snapshot = environment_config.get("snapshot", {})
-    primary = environment_config.get("primary", {})
-
-    return {
-        "bucket": snapshot.get(
-            "bucket",
-            primary.get("snapshot_bucket")
-        ),
-        "prefix": snapshot.get(
-            "prefix",
-            primary.get("snapshot_prefix", "raft-snapshots/")
-        ),
-        "region": snapshot.get(
-            "region",
-            environment_config.get("aws_region")
-        ),
-        "expected_interval_seconds": snapshot.get(
-            "expected_interval_seconds"
-        ),
-        "max_snapshot_age_seconds": snapshot.get(
-            "max_snapshot_age_seconds"
-        )
-    }
-
-
-def expected_snapshot_interval(environment_config):
-    snapshot = get_snapshot_config(environment_config)
-    configured = safe_int(snapshot.get("expected_interval_seconds"))
-
-    if configured is not None:
-        return configured
-
-    if "inc" in environment_config.get("tier", "").lower():
-        return 28800
-
-    return 1800
-
-
-def expected_snapshot_window(environment_config):
-    snapshot = get_snapshot_config(environment_config)
-    configured = safe_int(snapshot.get("max_snapshot_age_seconds"))
-
-    if configured is not None:
-        return configured
-
-    if "inc" in environment_config.get("tier", "").lower():
-        return 28800
-
-    return 2400
-
-
-def validate_config(environment, environment_config):
-    cloud = environment_config.get("cloud", "").lower()
-    primary = environment_config.get("primary", {})
-    dr = environment_config.get("dr", {})
-    snapshot = get_snapshot_config(environment_config)
-
-    if cloud not in ["aws", "gcp"]:
-        raise ValidationError(
-            "Environment '{0}' must define cloud as aws or gcp.".format(
-                environment
-            )
-        )
-
-    if not primary.get("vault_addr"):
-        raise ValidationError("Missing primary.vault_addr in config.")
-
-    if not dr.get("vault_addr"):
-        raise ValidationError("Missing dr.vault_addr in config.")
-
-    if not snapshot.get("bucket"):
-        raise ValidationError("Missing snapshot bucket in config.")
-
-
-def check_primary_token(runner, primary_env):
-    data, _ = runner.run_json(
-        ["vault", "token", "lookup"],
-        env=primary_env
-    )
-
-    if not extract_data(data):
-        raise ValidationError("Primary token validation returned no data.")
-
-
-def check_dr_operation_token(runner, dr_env, dr_token):
-    runner.run_json(
-        [
-            "vault",
-            "operator",
-            "raft",
-            "list-peers",
-            "-dr-token={0}".format(dr_token)
-        ],
-        env=dr_env
+def status(runner, env):
+    return runner.json(
+        ["vault", "status", "-format=json"],
+        env,
+        allowed_codes=[0, 1, 2, 3, 4]
     )
 
 
-def check_aws_credentials(runner, aws_env):
-    data, _ = runner.run_json(
-        ["aws", "sts", "get-caller-identity"],
-        env=aws_env
-    )
-
-    if not data.get("Account") or not data.get("Arn"):
-        raise ValidationError("AWS credentials could not be validated.")
-
-
-def check_gcp_credentials(runner, gcp_env, bucket):
-    runner.run(
-        ["gsutil", "ls", "-b", "gs://{0}".format(bucket)],
-        env=gcp_env
-    )
-
-
-def check_vault_status(runner, env_vars, cluster_name, cache, cache_key):
-    data, return_code = runner.run_json(
-        ["vault", "status"],
-        env=env_vars,
-        check=False
-    )
-
-    if return_code not in [0, 2]:
-        raise ValidationError(
-            "{0} vault status returned exit code {1}.".format(
-                cluster_name,
-                return_code
-            )
-        )
-
-    cache[cache_key] = data
-
-    if data.get("initialized") is not True:
-        raise ValidationError(
-            "{0} is not initialized.".format(cluster_name)
-        )
-
-    if data.get("sealed") is not False:
-        raise ValidationError(
-            "{0} is sealed.".format(cluster_name)
-        )
-
-    return CheckResult(
-        "Vault status ({0})".format(cluster_name.lower()),
-        "PASS",
-        "{0} is initialized and unsealed.".format(cluster_name),
-        "Cluster Health",
-        {
-            "initialized": data.get("initialized"),
-            "sealed": data.get("sealed"),
-            "version": data.get("version"),
-            "cluster_name": data.get("cluster_name"),
-            "ha_mode": data.get("ha_mode"),
-            "storage_type": data.get("storage_type"),
-            "raft_committed_index": data.get("raft_committed_index"),
-            "raft_applied_index": data.get("raft_applied_index")
-        }
-    )
-
-
-def check_raft_peers(runner, env_vars, cluster_name, expected_count, dr_token=None):
-    command = ["vault", "operator", "raft", "list-peers"]
-
-    if dr_token:
-        command.append("-dr-token={0}".format(dr_token))
-
-    data, _ = runner.run_json(command, env=env_vars)
-    servers = extract_data(data).get("config", {}).get("servers", [])
-
-    leaders = [
-        server for server in servers
-        if server.get("leader") is True
-    ]
-    followers = [
-        server for server in servers
-        if server.get("leader") is not True
-    ]
-    non_voters = [
-        server for server in servers
-        if server.get("voter") is not True
-    ]
-
-    if len(servers) != expected_count:
-        raise ValidationError(
-            "{0}: expected {1} Raft peers, found {2}.".format(
-                cluster_name,
-                expected_count,
-                len(servers)
-            )
-        )
-
-    if len(leaders) != 1:
-        raise ValidationError(
-            "{0}: expected 1 Raft leader, found {1}.".format(
-                cluster_name,
-                len(leaders)
-            )
-        )
-
-    if len(followers) != expected_count - 1:
-        raise ValidationError(
-            "{0}: expected {1} followers, found {2}.".format(
-                cluster_name,
-                expected_count - 1,
-                len(followers)
-            )
-        )
-
-    if non_voters:
-        raise ValidationError(
-            "{0}: found {1} non-voter Raft peers.".format(
-                cluster_name,
-                len(non_voters)
-            )
-        )
-
-    return CheckResult(
-        "Raft peers ({0})".format(cluster_name.lower()),
-        "PASS",
-        "{0} has 1 leader, {1} followers, and all peers are voters.".format(
-            cluster_name,
-            len(followers)
-        ),
-        "Raft",
-        {
-            "peer_count": len(servers),
-            "leader_count": len(leaders),
-            "follower_count": len(followers),
-            "all_voters": True,
-            "servers": servers
-        }
-    )
-
-
-def check_autopilot(runner, env_vars, cluster_name, dr_token=None):
-    command = ["vault", "operator", "raft", "autopilot", "get-config"]
-
-    if dr_token:
-        command.append("-dr-token={0}".format(dr_token))
-
-    data, _ = runner.run_json(command, env=env_vars)
-    payload = extract_data(data)
-
-    return CheckResult(
-        "Autopilot config ({0})".format(cluster_name.lower()),
-        "PASS",
-        "Autopilot configuration was retrieved successfully.",
-        "Raft",
-        {
-            "cleanup_dead_servers": payload.get("cleanup_dead_servers"),
-            "last_contact_threshold": payload.get("last_contact_threshold"),
-            "dead_server_last_contact_threshold": payload.get(
-                "dead_server_last_contact_threshold"
-            ),
-            "server_stabilization_time": payload.get(
-                "server_stabilization_time"
-            ),
-            "min_quorum": payload.get("min_quorum"),
-            "max_trailing_logs": payload.get("max_trailing_logs"),
-            "disable_upgrade_migration": payload.get(
-                "disable_upgrade_migration"
-            )
-        }
-    )
-
-
-def create_test_secret_path(base_path, validation_label):
-    safe_label = re.sub(
-        r"[^A-Za-z0-9_-]",
-        "-",
-        validation_label
-    ).strip("-")
-
-    if not safe_label:
-        raise ValidationError("Validation label cannot create a safe secret path.")
-
-    return "{0}/{1}-{2}".format(
-        base_path.strip("/"),
-        utc_now().strftime("%d%b%Y"),
-        safe_label
-    )
-
-
-def check_test_secret_write(runner, primary_env, runtime):
-    runner.run(
-        [
-            "vault",
-            "write",
-            runtime["test_secret_path"],
-            "Test=success"
-        ],
-        env=primary_env
-    )
-
-    return CheckResult(
-        "Write test secret",
-        "PASS",
-        "Test secret was written successfully.",
-        "Functional",
-        {
-            "secret_path": runtime["test_secret_path"],
-            "key": "Test",
-            "value": "success"
-        }
-    )
-
-
-def check_test_secret_read(runner, primary_env, runtime):
-    data, _ = runner.run_json(
-        ["vault", "read", runtime["test_secret_path"]],
-        env=primary_env
-    )
-
-    value = extract_data(data).get("Test")
-
-    if str(value).lower() != "success":
-        raise ValidationError(
-            "Test secret read failed. Expected Test=success; found Test={0}.".format(
-                value
-            )
-        )
-
-    return CheckResult(
-        "Read test secret",
-        "PASS",
-        "Test secret was read successfully.",
-        "Functional",
-        {
-            "secret_path": runtime["test_secret_path"],
-            "key": "Test",
-            "value": value
-        }
-    )
-
-
-def check_snapshot_config(runner, primary_env, environment_config):
-    data = runner.run_json_with_retries(
-        ["vault", "read", "sys/storage/raft/snapshot-auto/config/s3"],
-        env=primary_env,
-        retries=environment_config.get("snapshot_retry_attempts", 4),
-        delay_seconds=environment_config.get("snapshot_retry_delay_seconds", 15)
-    )
-
-    payload = extract_data(data)
-    interval = safe_int(payload.get("interval"))
-    expected = expected_snapshot_interval(environment_config)
-
-    if interval != expected:
-        raise ValidationError(
-            "Snapshot interval is {0}; expected {1} seconds.".format(
-                interval,
-                expected
-            )
-        )
-
-    return CheckResult(
-        "Auto snapshot config",
-        "PASS",
-        "Snapshot configuration was retrieved with the expected interval.",
-        "Snapshots",
-        {
-            "interval_seconds": interval,
-            "expected_interval_seconds": expected,
-            "bucket": payload.get("aws_s3_bucket"),
-            "region": payload.get("aws_s3_region"),
-            "path_prefix": payload.get("path_prefix"),
-            "retain": payload.get("retain"),
-            "storage_type": payload.get("storage_type")
-        }
-    )
-
-
-def check_snapshot_status(runner, primary_env, environment_config):
-    data = runner.run_json_with_retries(
-        ["vault", "read", "sys/storage/raft/snapshot-auto/status/s3"],
-        env=primary_env,
-        retries=environment_config.get("snapshot_retry_attempts", 4),
-        delay_seconds=environment_config.get("snapshot_retry_delay_seconds", 15)
-    )
-
-    payload = extract_data(data)
-    last_snapshot = parse_iso_datetime(payload.get("last_snapshot_end"))
-    next_snapshot = parse_iso_datetime(payload.get("next_snapshot_start"))
-    snapshot_url = payload.get("last_snapshot_url") or payload.get("snapshot_url")
-    allowed_window = expected_snapshot_window(environment_config)
-    consecutive_errors = safe_int(payload.get("consecutive_errors"))
-
-    if not last_snapshot:
-        raise ValidationError("Snapshot status does not contain last_snapshot_end.")
-
-    if not next_snapshot:
-        raise ValidationError("Snapshot status does not contain next_snapshot_start.")
-
-    if not snapshot_url:
-        raise ValidationError("Snapshot status does not contain a snapshot URL.")
-
-    last_snapshot_age = int((utc_now() - last_snapshot).total_seconds())
-    next_snapshot_wait = int((next_snapshot - utc_now()).total_seconds())
-
-    if last_snapshot_age < 0 or last_snapshot_age > allowed_window:
-        raise ValidationError(
-            "Last snapshot age is {0} seconds; maximum allowed is {1} seconds.".format(
-                last_snapshot_age,
-                allowed_window
-            )
-        )
-
-    if next_snapshot_wait < 0 or next_snapshot_wait > allowed_window:
-        raise ValidationError(
-            "Next snapshot is scheduled in {0} seconds; allowed maximum is {1} seconds.".format(
-                next_snapshot_wait,
-                allowed_window
-            )
-        )
-
-    if consecutive_errors not in [None, 0]:
-        raise ValidationError(
-            "Snapshot status reports consecutive_errors={0}.".format(
-                consecutive_errors
-            )
-        )
-
-    return CheckResult(
-        "Auto snapshot status",
-        "PASS",
-        "Last and next automated snapshots are within the expected window.",
-        "Snapshots",
-        {
-            "last_snapshot_end": payload.get("last_snapshot_end"),
-            "next_snapshot_start": payload.get("next_snapshot_start"),
-            "snapshot_url": snapshot_url,
-            "last_snapshot_age_seconds": last_snapshot_age,
-            "next_snapshot_wait_seconds": next_snapshot_wait,
-            "allowed_window_seconds": allowed_window,
-            "consecutive_errors": consecutive_errors
-        }
-    )
-
-
-def check_primary_replication(runner, primary_env):
-    data, _ = runner.run_json(
-        ["vault", "read", "sys/replication/status"],
-        env=primary_env
-    )
-
-    dr = extract_data(data).get("dr", {})
-    secondaries = dr.get("secondaries", [])
-    connection_states = [
-        secondary.get("connection_status")
-        for secondary in secondaries
-    ]
-
-    if dr.get("mode") != "primary":
-        raise ValidationError(
-            "Primary replication mode is '{0}', expected 'primary'.".format(
-                dr.get("mode")
-            )
-        )
-
-    if dr.get("state") != "running":
-        raise ValidationError(
-            "Primary replication state is '{0}', expected 'running'.".format(
-                dr.get("state")
-            )
-        )
-
-    if not secondaries or any(status != "connected" for status in connection_states):
-        raise ValidationError(
-            "Primary replication is not connected to every DR secondary."
-        )
-
-    return CheckResult(
-        "Replication status",
-        "PASS",
-        "Primary replication is running and connected.",
-        "Replication",
-        {
-            "mode": dr.get("mode"),
-            "state": dr.get("state"),
-            "last_wal": dr.get("last_wal"),
-            "last_dr_wal": dr.get("last_dr_wal"),
-            "secondary_count": len(secondaries),
-            "connection_statuses": connection_states
-        }
-    )
-
-
-def check_dr_replication(runner, dr_env):
-    data, _ = runner.run_json(
-        ["vault", "read", "sys/replication/status"],
-        env=dr_env
-    )
-
-    dr = extract_data(data).get("dr", {})
-    primaries = dr.get("primaries", [])
-    connection_states = [
-        primary.get("connection_status")
-        for primary in primaries
-    ]
-
-    if dr.get("mode") != "secondary":
-        raise ValidationError(
-            "DR replication mode is '{0}', expected 'secondary'.".format(
-                dr.get("mode")
-            )
-        )
-
-    if dr.get("state") != "stream-wals":
-        raise ValidationError(
-            "DR replication state is '{0}', expected 'stream-wals'.".format(
-                dr.get("state")
-            )
-        )
-
-    if dr.get("connection_state") != "ready":
-        raise ValidationError(
-            "DR connection state is '{0}', expected 'ready'.".format(
-                dr.get("connection_state")
-            )
-        )
-
-    if not primaries or any(status != "connected" for status in connection_states):
-        raise ValidationError(
-            "DR replication is not connected to every primary endpoint."
-        )
-
-    return CheckResult(
-        "Replication status",
-        "PASS",
-        "DR replication is streaming WALs and connected.",
-        "Replication",
-        {
-            "mode": dr.get("mode"),
-            "state": dr.get("state"),
-            "connection_state": dr.get("connection_state"),
-            "last_remote_wal": dr.get("last_remote_wal"),
-            "primary_count": len(primaries),
-            "connection_statuses": connection_states
-        }
-    )
-
-
-def extract_members(payload):
-    data = extract_data(payload)
-
-    if isinstance(data, list):
-        return data
-
-    if isinstance(data, dict):
-        for key in ["members", "servers", "nodes"]:
-            if isinstance(data.get(key), list):
-                return data.get(key)
+def check_status(runner, env):
+    payload = status(runner, env)
+
+    expect(as_bool(payload.get("initialized")), "Vault is not initialized.")
+    expect(not as_bool(payload.get("sealed")), "Vault is sealed.")
+
+    return make_evidence(payload, {
+        "initialized": payload.get("initialized"),
+        "sealed": payload.get("sealed")
+    })
+
+
+def raft_servers(value):
+    if isinstance(value, list):
+        matching = [
+            item for item in value
+            if isinstance(item, dict) and
+            "node_id" in item and
+            "address" in item and
+            "leader" in item and
+            "voter" in item
+        ]
+
+        if matching:
+            return matching
+
+        for item in value:
+            found = raft_servers(item)
+            if found:
+                return found
+
+    elif isinstance(value, dict):
+        for item in value.values():
+            found = raft_servers(item)
+            if found:
+                return found
 
     return []
 
 
-def check_operator_members(runner, primary_env, expected_count):
-    data, _ = runner.run_json(
-        ["vault", "operator", "members"],
-        env=primary_env
-    )
-
-    members = extract_members(data)
-
-    if not members:
-        raise ValidationError(
-            "Operator members output was retrieved but no member list could be parsed."
-        )
-
-    if len(members) != expected_count:
-        raise ValidationError(
-            "Expected {0} operator members; found {1}.".format(
-                expected_count,
-                len(members)
-            )
-        )
-
-    active_members = [
-        member for member in members
-        if member.get("active_node") is True
+def check_raft(runner, env, dr_token=None):
+    command = [
+        "vault", "operator", "raft", "list-peers", "-format=json"
     ]
 
-    return CheckResult(
-        "Operator members",
-        "PASS",
-        "{0} Vault operator members were retrieved.".format(len(members)),
-        "Cluster Health",
-        {
-            "member_count": len(members),
-            "active_member_count": len(active_members)
+    if dr_token:
+        command.append("-dr-token={0}".format(dr_token))
+
+    payload = runner.json(command, env)
+    servers = raft_servers(extract_data(payload))
+
+    expect(bool(servers), "Raft JSON output did not contain servers.")
+
+    leaders = [item for item in servers if as_bool(item.get("leader"))]
+    followers = [item for item in servers if not as_bool(item.get("leader"))]
+    voters = [item for item in servers if as_bool(item.get("voter"))]
+
+    expect(len(servers) == 5, "Expected 5 Raft peers; found {0}.".format(
+        len(servers)
+    ))
+    expect(len(leaders) == 1, "Expected 1 Raft leader.")
+    expect(len(followers) == 4, "Expected 4 Raft followers.")
+    expect(len(voters) == 5, "Expected 5 Raft voters.")
+
+    return make_evidence(payload, {
+        "peer_count": len(servers),
+        "leader_count": len(leaders),
+        "follower_count": len(followers),
+        "voter_count": len(voters)
+    })
+
+
+def check_autopilot(runner, env, dr_token=None):
+    command = [
+        "vault", "operator", "raft", "autopilot", "get-config",
+        "-format=json"
+    ]
+
+    if dr_token:
+        command.append("-dr-token={0}".format(dr_token))
+
+    return make_evidence(runner.json(command, env))
+
+
+def check_write(runner, context):
+    command = [
+        "vault", "write", "-format=json",
+        context["test_path"], "Test=success"
+    ]
+
+    output = runner.run(command, context["primary_env"])
+
+    try:
+        response = json.loads(output) if output.strip() else {}
+    except ValueError:
+        response = {"message": output.strip()}
+
+    if not response:
+        response = {
+            "message": "Vault accepted the write with no response body."
         }
+
+    return make_evidence(response, {
+        "validation_path": context["test_path"],
+        "write_command_completed": True
+    })
+
+
+def find_test(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() == "test":
+                return item
+
+            found = find_test(item)
+            if found is not None:
+                return found
+
+    elif isinstance(value, list):
+        for item in value:
+            found = find_test(item)
+            if found is not None:
+                return found
+
+    return None
+
+
+def check_read(runner, context):
+    payload = runner.json(
+        ["vault", "read", "-format=json", context["test_path"]],
+        context["primary_env"]
     )
 
+    value = find_test(payload)
 
-def count_items(payload):
+    expect(
+        str(value).lower() == "success",
+        "Expected Test=success; got {0}.".format(value)
+    )
+
+    return make_evidence(payload, {
+        "validation_path": context["test_path"],
+        "Test": value
+    })
+
+
+def check_snapshot_config(runner, context):
+    payload = runner.json(
+        [
+            "vault", "read", "-format=json",
+            "sys/storage/raft/snapshot-auto/config/s3"
+        ],
+        context["primary_env"],
+        retries=3
+    )
+
+    interval = find_first(
+        extract_data(payload),
+        ["interval", "snapshot_interval"]
+    )
+
+    expected = int(
+        context["profile"].get("snapshot_interval_seconds", 1800)
+    )
+
+    expect(interval is not None, "Snapshot interval was not found.")
+    expect(
+        int(interval) == expected,
+        "Expected interval {0}; found {1}.".format(expected, interval)
+    )
+
+    return make_evidence(payload, {
+        "expected_interval_seconds": expected,
+        "reported_interval_seconds": interval
+    })
+
+
+def check_snapshot_status(runner, context):
+    payload = runner.json(
+        [
+            "vault", "read", "-format=json",
+            "sys/storage/raft/snapshot-auto/status/s3"
+        ],
+        context["primary_env"],
+        retries=3
+    )
+
     data = extract_data(payload)
 
-    if isinstance(data, list):
-        return len(data)
+    latest_text = find_first(data, [
+        "last_snapshot_time",
+        "last_snapshot",
+        "last_successful_snapshot"
+    ])
 
-    if isinstance(data, dict):
-        if isinstance(data.get("keys"), list):
-            return len(data.get("keys"))
-        return len(data)
+    latest = parse_time(latest_text)
 
-    return 0
+    expect(latest is not None, "Latest snapshot timestamp was not found.")
 
-
-def check_vault_inventory(runner, primary_env):
-    secrets, _ = runner.run_json(
-        ["vault", "secrets", "list"],
-        env=primary_env
-    )
-    auth, _ = runner.run_json(
-        ["vault", "auth", "list"],
-        env=primary_env
-    )
-    policies, _ = runner.run_json(
-        ["vault", "policy", "list"],
-        env=primary_env
+    max_age = int(
+        context["profile"].get("snapshot_max_age_seconds", 2400)
     )
 
-    return CheckResult(
-        "Secrets, auth, and policy counts",
-        "PASS",
-        "Secrets, auth methods, and policies were retrieved successfully.",
-        "Inventory",
-        {
-            "secret_mount_count": count_items(secrets),
-            "auth_mount_count": count_items(auth),
-            "policy_count": count_items(policies)
-        }
+    age = (
+        datetime.datetime.now(datetime.timezone.utc) - latest
+    ).total_seconds()
+
+    expect(
+        age <= max_age,
+        "Latest snapshot is {0:.0f} seconds old.".format(age)
     )
 
-
-def check_license(runner, primary_env, warning_days):
-    data, _ = runner.run_json(
-        ["vault", "license", "get"],
-        env=primary_env
-    )
-
-    expiration = extract_data(data).get("expiration_time")
-    expiration_date = parse_iso_datetime(expiration)
-
-    if not expiration_date:
-        raise ValidationError(
-            "License expiration_time was not returned or could not be parsed."
-        )
-
-    days_remaining = int(
-        (expiration_date - utc_now()).total_seconds() / 86400
-    )
-
-    if days_remaining < warning_days:
-        raise ValidationError(
-            "Vault license expires in {0} days; minimum required is {1} days.".format(
-                days_remaining,
-                warning_days
-            )
-        )
-
-    return CheckResult(
-        "Vault license status",
-        "PASS",
-        "Vault license is valid for {0} more days.".format(days_remaining),
-        "Compliance",
-        {
-            "expiration_time": expiration,
-            "days_remaining": days_remaining,
-            "minimum_required_days": warning_days
-        }
-    )
-
-
-def check_audit_devices(runner, primary_env):
-    data, _ = runner.run_json(
-        ["vault", "audit", "list", "-detailed"],
-        env=primary_env
-    )
-
-    audit_devices = extract_data(data)
-    count = len(audit_devices) if isinstance(audit_devices, dict) else 0
-
-    return CheckResult(
-        "Audit devices",
-        "PASS",
-        "Audit device configuration was retrieved successfully.",
-        "Compliance",
-        {
-            "audit_device_count": count,
-            "audit_paths": sorted(audit_devices.keys())
-            if isinstance(audit_devices, dict) else []
-        }
-    )
-
-
-def check_vault_version(cache, cache_key, cluster_name):
-    status = cache.get(cache_key, {})
-    version = status.get("version")
-
-    if not version:
-        raise ValidationError(
-            "{0} Vault version was not available from vault status.".format(
-                cluster_name
-            )
-        )
-
-    return CheckResult(
-        "Vault version",
-        "PASS",
-        "{0} Vault version is {1}.".format(cluster_name, version),
-        "Cluster Health",
-        {
-            "version": version,
-            "build_date": status.get("build_date")
-        }
-    )
-
-
-def check_recovery_info(cache, cache_key, cluster_name):
-    status = cache.get(cache_key, {})
-
-    shares = status.get("recovery_shares")
-    threshold = status.get("recovery_threshold")
-
-    if shares is None:
-        shares = status.get("shares")
-
-    if threshold is None:
-        threshold = status.get("threshold")
-
-    if shares is None or threshold is None:
-        raise ValidationError(
-            "{0} recovery shares or threshold were not returned.".format(
-                cluster_name
-            )
-        )
-
-    return CheckResult(
-        "Recovery shares and threshold",
-        "PASS",
-        "{0} recovery configuration was retrieved successfully.".format(
-            cluster_name
+    return make_evidence(payload, {
+        "latest_snapshot": latest_text,
+        "next_snapshot": find_first(
+            data,
+            ["next_snapshot_time", "next_snapshot"]
         ),
-        "Cluster Health",
-        {
-            "recovery_shares": shares,
-            "recovery_threshold": threshold
-        }
+        "age_seconds": int(age),
+        "maximum_age_seconds": max_age
+    })
+
+
+def check_replication(runner, env, expected_mode, expected_state):
+    payload = runner.json(
+        ["vault", "read", "-format=json", "sys/replication/status"],
+        env
     )
 
+    data = extract_data(payload)
+    dr_data = data.get("dr", data) if isinstance(data, dict) else data
 
-def split_ssl_address(address):
-    parsed = urlparse(address)
+    mode = find_first(dr_data, ["mode"])
+    state = find_first(dr_data, ["state"])
 
-    if not parsed.hostname:
-        raise ValidationError("Invalid SSL address: {0}".format(address))
-
-    return parsed.hostname, parsed.port or 443
-
-
-def check_ssl_certificate(runner, address, cluster_name, warning_days):
-    host, port = split_ssl_address(address)
-
-    handshake = runner.run(
-        [
-            "openssl",
-            "s_client",
-            "-showcerts",
-            "-connect",
-            "{0}:{1}".format(host, port),
-            "-servername",
-            host
-        ],
-        check=False,
-        input_text=""
+    raw_connections = all_values(
+        dr_data,
+        ["connection_state", "connection_status"]
     )
 
-    if not handshake.stdout.strip():
-        raise ValidationError(
-            "{0} SSL handshake returned no certificate output.".format(
-                cluster_name
-            )
-        )
+    connections = []
 
-    certificate = runner.run(
-        [
-            "openssl",
-            "x509",
-            "-noout",
-            "-subject",
-            "-issuer",
-            "-startdate",
-            "-enddate",
-            "-fingerprint",
-            "-sha256"
-        ],
-        input_text=handshake.stdout
-    )
-
-    values = {}
-    for line in certificate.stdout.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            values[key.strip().lower()] = value.strip()
-
-    expiry = parse_openssl_datetime(values.get("notafter", ""))
-
-    if not expiry:
-        raise ValidationError(
-            "{0} SSL expiry date could not be parsed.".format(cluster_name)
-        )
-
-    days_remaining = int((expiry - utc_now()).total_seconds() / 86400)
-
-    if days_remaining < warning_days:
-        raise ValidationError(
-            "{0} SSL certificate expires in {1} days; minimum is {2} days.".format(
-                cluster_name,
-                days_remaining,
-                warning_days
-            )
-        )
-
-    return CheckResult(
-        "SSL certificate",
-        "PASS",
-        "{0} SSL certificate is valid for {1} more days.".format(
-            cluster_name,
-            days_remaining
-        ),
-        "Compliance",
-        {
-            "address": "{0}:{1}".format(host, port),
-            "subject": values.get("subject"),
-            "issuer": values.get("issuer"),
-            "issued_on": values.get("notbefore"),
-            "expires_on": values.get("notafter"),
-            "days_remaining": days_remaining,
-            "minimum_required_days": warning_days,
-            "sha256_fingerprint": values.get("sha256 fingerprint")
-        }
-    )
-
-
-def list_aws_snapshots(runner, aws_env, bucket, prefix, region):
-    objects = []
-    continuation_token = None
-
-    while True:
-        command = [
-            "aws",
-            "s3api",
-            "list-objects-v2",
-            "--bucket",
-            bucket,
-            "--prefix",
-            prefix
-        ]
-
-        if region:
-            command.extend(["--region", region])
-
-        if continuation_token:
-            command.extend([
-                "--continuation-token",
-                continuation_token
+    for item in raw_connections:
+        if isinstance(item, list):
+            connections.extend([
+                str(value).lower() for value in item
+                if value not in (None, "")
             ])
+        elif item not in (None, ""):
+            connections.append(str(item).lower())
 
-        page, _ = runner.run_json(command, env=aws_env)
-        objects.extend(page.get("Contents", []))
+    expect(str(mode).lower() == expected_mode, "Unexpected DR mode.")
+    expect(str(state).lower() == expected_state, "Unexpected DR state.")
+    expect(bool(connections), "Replication connection state not found.")
 
-        if not page.get("IsTruncated"):
-            break
+    valid = ["connected"]
 
-        continuation_token = page.get("NextContinuationToken")
-        if not continuation_token:
-            break
+    if expected_mode == "secondary":
+        valid.append("ready")
 
-    return objects
-
-
-def list_gcp_snapshots(runner, gcp_env, bucket, prefix):
-    result = runner.run(
-        [
-            "gsutil",
-            "ls",
-            "-l",
-            "gs://{0}/{1}**".format(bucket, prefix)
-        ],
-        env=gcp_env
+    expect(
+        all(value in valid for value in connections),
+        "Unexpected connection state: {0}.".format(
+            ", ".join(connections)
+        )
     )
 
-    objects = []
-    pattern = re.compile(r"^\s*(\d+)\s+(\S+)\s+(gs://\S+)")
-
-    for line in result.stdout.splitlines():
-        match = pattern.match(line.strip())
-
-        if match:
-            objects.append({
-                "Size": match.group(1),
-                "LastModified": match.group(2),
-                "Key": match.group(3)
-            })
-
-    return objects
-
-
-def check_cloud_snapshots(runner, environment_config, aws_env, gcp_env):
-    cloud = environment_config["cloud"].lower()
-    snapshot = get_snapshot_config(environment_config)
-
-    if cloud == "aws":
-        objects = list_aws_snapshots(
-            runner,
-            aws_env,
-            snapshot["bucket"],
-            snapshot["prefix"],
-            snapshot["region"]
-        )
-    else:
-        objects = list_gcp_snapshots(
-            runner,
-            gcp_env,
-            snapshot["bucket"],
-            snapshot["prefix"]
-        )
-
-    if not objects:
-        raise ValidationError(
-            "No snapshots found in {0} bucket '{1}'.".format(
-                cloud.upper(),
-                snapshot["bucket"]
-            )
-        )
-
-    latest_three = sorted(
-        objects,
-        key=lambda item: item.get("LastModified", ""),
-        reverse=True
-    )[:3]
-
-    return CheckResult(
-        "Latest cloud snapshots",
-        "PASS",
-        "The latest three {0} snapshots were retrieved successfully.".format(
-            cloud.upper()
+    return make_evidence(payload, {
+        "mode": mode,
+        "state": state,
+        "connection_states": connections,
+        "last_wal_entry": find_first(
+            dr_data,
+            ["last_wal", "last_wal_entry"]
         ),
-        "Snapshots",
-        {
-            "cloud": cloud.upper(),
-            "bucket": snapshot["bucket"],
-            "prefix": snapshot["prefix"],
-            "snapshots": [
-                {
-                    "object": item.get("Key"),
-                    "last_modified": item.get("LastModified"),
-                    "size": item.get("Size")
-                }
-                for item in latest_three
-            ]
-        }
-    )
+        "last_remote_entry": find_first(
+            dr_data,
+            ["last_remote_wal", "last_remote_entry"]
+        )
+    })
 
 
-def evidence_summary(evidence):
-    if not evidence:
-        return "No additional evidence."
+def member_records(value):
+    if isinstance(value, list):
+        output = []
+        for item in value:
+            output.extend(member_records(item))
+        return output
+
+    if not isinstance(value, dict):
+        return []
+
+    keys = [
+        "hostname", "host_name", "api_address",
+        "cluster_address", "active_node", "last_echo"
+    ]
+
+    if any(key in value for key in keys):
+        return [value]
 
     output = []
 
-    for key in sorted(evidence.keys()):
-        value = evidence.get(key)
+    for item in value.values():
+        output.extend(member_records(item))
 
-        if value is None:
-            continue
+    return output
 
-        if isinstance(value, list):
-            shown = "{0} item(s)".format(len(value))
-        elif isinstance(value, dict):
-            shown = "{0} field(s)".format(len(value))
-        else:
-            shown = str(value)
 
-        output.append(
-            "{0}: {1}".format(
-                key.replace("_", " ").title(),
-                shown
+def check_members(runner, context):
+    payload = runner.json(
+        ["vault", "operator", "members", "-format=json"],
+        context["primary_env"]
+    )
+
+    members = member_records(extract_data(payload))
+    active = [
+        item for item in members if as_bool(item.get("active_node"))
+    ]
+
+    expect(bool(members), "No operator member list was returned.")
+    expect(len(members) == 5, "Expected 5 members; found {0}.".format(
+        len(members)
+    ))
+    expect(len(active) == 1, "Expected 1 active operator member.")
+
+    return make_evidence(payload, {
+        "member_count": len(members),
+        "active_member_count": len(active)
+    })
+
+
+def check_inventory(runner, context):
+    secrets = extract_data(runner.json(
+        ["vault", "secrets", "list", "-format=json"],
+        context["primary_env"]
+    ))
+
+    auth = extract_data(runner.json(
+        ["vault", "auth", "list", "-format=json"],
+        context["primary_env"]
+    ))
+
+    policies = extract_data(runner.json(
+        ["vault", "policy", "list", "-format=json"],
+        context["primary_env"]
+    ))
+
+    if isinstance(policies, dict):
+        policies = policies.get("keys", [])
+
+    return {
+        "secret_mount_count": len(secrets)
+        if isinstance(secrets, dict) else 0,
+
+        "auth_mount_count": len(auth)
+        if isinstance(auth, dict) else 0,
+
+        "policy_count": len(policies)
+        if isinstance(policies, list) else 0
+    }
+
+
+def check_license(runner, context):
+    payload = runner.json(
+        ["vault", "license", "get", "-format=json"],
+        context["primary_env"]
+    )
+
+    expiration_text = find_first(
+        payload,
+        ["expiration_time", "expiration"]
+    )
+
+    expiration = parse_time(expiration_text)
+
+    expect(expiration is not None, "License expiration was not found.")
+
+    days = (
+        expiration - datetime.datetime.now(datetime.timezone.utc)
+    ).total_seconds() / 86400.0
+
+    expect(days >= 60, "License expires in {0:.0f} days.".format(days))
+
+    return make_evidence(payload, {
+        "expiration_time": expiration_text,
+        "days_remaining": int(days)
+    })
+
+
+def check_audit(runner, context):
+    payload = runner.json(
+        [
+            "vault", "audit", "list",
+            "-detailed", "-format=json"
+        ],
+        context["primary_env"]
+    )
+
+    return make_evidence(payload)
+
+
+def check_cloud_snapshots(runner, context):
+    bucket = context["profile"].get("snapshot_bucket", "")
+    prefix = context["profile"].get("snapshot_prefix", "")
+
+    expect(
+        bucket and "SNAPSHOT-BUCKET" not in bucket,
+        "Snapshot bucket is not configured."
+    )
+
+    if context["profile"]["provider"] == "aws":
+        command = [
+            "aws", "s3api", "list-objects-v2",
+            "--bucket", bucket,
+            "--prefix", prefix,
+            "--output", "json",
+            "--query",
+            "reverse(sort_by(Contents,&LastModified))[:3]."
+            "{Key:Key,LastModified:LastModified,Size:Size}"
+        ]
+
+        payload = runner.json(command, context["primary_env"])
+
+    else:
+        payload = runner.json(
+            [
+                "gcloud", "storage", "objects", "list",
+                "gs://{0}/{1}".format(bucket, prefix),
+                "--format=json",
+                "--sort-by=~updateTime",
+                "--limit=3"
+            ],
+            context["primary_env"]
+        )
+
+    snapshots = payload if isinstance(payload, list) else payload.get(
+        "Contents", []
+    )
+
+    expect(bool(snapshots), "No raft snapshots found.")
+
+    return make_evidence(payload, {
+        "snapshot_count_returned": len(snapshots)
+    })
+
+
+def check_version(runner, env):
+    payload = status(runner, env)
+    version = find_first(payload, ["version"])
+
+    expect(bool(version), "Vault version was not found.")
+    return make_evidence(payload, {"version": version})
+
+
+def check_recovery(runner, env):
+    payload = status(runner, env)
+
+    shares = find_first(payload, [
+        "recovery_seal_shares",
+        "total_recovery_shares",
+        "recovery_shares",
+        "n"
+    ])
+
+    threshold = find_first(payload, [
+        "recovery_seal_threshold",
+        "recovery_threshold",
+        "t"
+    ])
+
+    expect(shares is not None, "Recovery shares not found in vault status.")
+    expect(
+        threshold is not None,
+        "Recovery threshold not found in vault status."
+    )
+
+    return make_evidence(payload, {
+        "source": "vault status -format=json",
+        "total_recovery_shares": shares,
+        "recovery_threshold": threshold
+    })
+
+
+def check_tls(address):
+    parsed = urlparse(address)
+    hostname = parsed.hostname
+    port = parsed.port or 443
+
+    expect(bool(hostname), "Invalid Vault address.")
+
+    context = ssl.create_default_context()
+
+    try:
+        with socket.create_connection((hostname, port), timeout=15) as raw:
+            with context.wrap_socket(
+                raw,
+                server_hostname=hostname
+            ) as secure:
+                certificate = secure.getpeercert()
+
+    except (socket.error, ssl.SSLError) as exc:
+        raise ValidationError("TLS validation failed: {0}".format(exc))
+
+    expiry = certificate.get("notAfter")
+    expiry_epoch = ssl.cert_time_to_seconds(expiry)
+    days = (expiry_epoch - time.time()) / 86400.0
+
+    expect(days >= 60, "TLS certificate expires in {0:.0f} days.".format(
+        days
+    ))
+
+    return {
+        "host": hostname,
+        "port": port,
+        "certificate_expiry": expiry,
+        "days_remaining": int(days)
+    }
+
+
+def execute(results, section, title, command, condition, steps, callback,
+            counts_only=False):
+    result = Result(
+        section, title, command, condition, steps, counts_only
+    )
+
+    try:
+        result.evidence = callback()
+        result.outcome = "verified"
+
+    except (ValidationError, CommandError) as exc:
+        result.error = clean_error(exc)
+
+    except Exception as exc:
+        result.error = "Unexpected validation error: {0}".format(
+            clean_error(exc)
+        )
+
+    results.append(result)
+
+
+def run_validations(context):
+    runner = Runner()
+    results = []
+
+    # Critical token validation. Stop only if the Primary token is invalid.
+    runner.json(
+        ["vault", "token", "lookup", "-format=json"],
+        context["primary_env"]
+    )
+
+    primary = context["primary_env"]
+    dr = context["dr_env"]
+    path = context["test_path"]
+
+    checks = [
+        ("Primary", "Vault status (Primary)",
+         "vault status -format=json",
+         "Initialized is true and Sealed is false.",
+         ["Confirm Initialized is true and Sealed is false."],
+         lambda: check_status(runner, primary), False),
+
+        ("Primary", "Raft list-peers (Primary)",
+         "vault operator raft list-peers -format=json",
+         "5 peers: 1 leader, 4 followers, and all 5 are voters.",
+         ["Confirm 1 leader, 4 followers, and 5 voters."],
+         lambda: check_raft(runner, primary), False),
+
+        ("Primary", "Raft autopilot configuration (Primary)",
+         "vault operator raft autopilot get-config -format=json",
+         "Autopilot configuration JSON is retrieved successfully.",
+         ["Compare output with approved configuration."],
+         lambda: check_autopilot(runner, primary), False),
+
+        ("Primary", "Validation secret write (Primary)",
+         "vault write -format=json {0} Test=success".format(path),
+         "Vault accepts Test=success at the generated validation path.",
+         ["Confirm token write access to the validation path."],
+         lambda: check_write(runner, context), False),
+
+        ("Primary", "Validation secret read (Primary)",
+         "vault read -format=json {0}".format(path),
+         "The generated validation path returns Test=success.",
+         ["Confirm Test=success is returned."],
+         lambda: check_read(runner, context), False),
+
+        ("Primary", "Snapshot configuration (Primary)",
+         "vault read -format=json "
+         "sys/storage/raft/snapshot-auto/config/s3",
+         "Configured snapshot interval matches the environment baseline.",
+         ["Confirm snapshot interval matches the baseline."],
+         lambda: check_snapshot_config(runner, context), False),
+
+        ("Primary", "Snapshot runtime status (Primary)",
+         "vault read -format=json "
+         "sys/storage/raft/snapshot-auto/status/s3",
+         "Latest snapshot is within the configured age limit.",
+         ["Retry after five minutes if required."],
+         lambda: check_snapshot_status(runner, context), False),
+
+        ("Primary", "DR replication state (Primary)",
+         "vault read -format=json sys/replication/status",
+         "Mode is primary, state is running, and connections are connected.",
+         ["Confirm Primary DR replication is healthy."],
+         lambda: check_replication(runner, primary, "primary", "running"),
+         False),
+
+        ("Primary", "Operator members (Primary)",
+         "vault operator members -format=json",
+         "5 members are listed and exactly 1 member is active.",
+         ["Confirm active node and expected peers are shown."],
+         lambda: check_members(runner, context), False),
+
+        ("Primary", "Vault inventory counts (Primary)",
+         "vault secrets list -format=json; vault auth list -format=json; "
+         "vault policy list -format=json",
+         "Secret mount, auth mount, and policy counts are retrieved.",
+         ["Compare counts with the approved baseline."],
+         lambda: check_inventory(runner, context), True),
+
+        ("Primary", "Vault license (Primary)",
+         "vault license get -format=json",
+         "License expiration is at least 60 days away.",
+         ["Confirm license expiration date."],
+         lambda: check_license(runner, context), False),
+
+        ("Primary", "Audit devices (Primary)",
+         "vault audit list -detailed -format=json",
+         "Detailed audit-device configuration is retrieved.",
+         ["Confirm approved audit devices remain configured."],
+         lambda: check_audit(runner, context), False),
+
+        ("Primary", "Vault version (Primary)",
+         "vault status -format=json",
+         "A Primary Vault version is returned.",
+         ["Confirm version matches approved AMI release."],
+         lambda: check_version(runner, primary), False),
+
+        ("Primary", "Recovery shares and threshold (Primary)",
+         "vault status -format=json",
+         "Recovery shares and threshold are returned by vault status.",
+         ["Confirm shares and threshold match approved recovery design."],
+         lambda: check_recovery(runner, primary), False),
+
+        ("Primary", "TLS certificate (Primary)",
+         "TLS handshake to Primary Vault address",
+         "Certificate expiry is at least 60 days away.",
+         ["Confirm certificate expiry date."],
+         lambda: check_tls(context["profile"]["primary_addr"]), False),
+
+        ("DR", "Vault status (DR)",
+         "vault status -format=json",
+         "Initialized is true and Sealed is false.",
+         ["Confirm Initialized is true and Sealed is false."],
+         lambda: check_status(runner, dr), False),
+
+        ("DR", "Raft list-peers (DR)",
+         "vault operator raft list-peers -format=json -dr-token=***",
+         "5 peers: 1 leader, 4 followers, and all 5 are voters.",
+         ["Confirm DR has 1 leader, 4 followers, and 5 voters."],
+         lambda: check_raft(runner, dr, context["dr_token"]), False),
+
+        ("DR", "Raft autopilot configuration (DR)",
+         "vault operator raft autopilot get-config "
+         "-format=json -dr-token=***",
+         "Autopilot configuration JSON is retrieved successfully.",
+         ["Compare output with approved DR configuration."],
+         lambda: check_autopilot(runner, dr, context["dr_token"]), False),
+
+        ("DR", "DR replication state (DR)",
+         "vault read -format=json sys/replication/status",
+         "Mode is secondary, state is stream-wals, and connection is ready.",
+         ["Confirm remote WAL continues advancing."],
+         lambda: check_replication(runner, dr, "secondary", "stream-wals"),
+         False),
+
+        ("DR", "Vault version (DR)",
+         "vault status -format=json",
+         "A DR Vault version is returned.",
+         ["Confirm version matches approved AMI release."],
+         lambda: check_version(runner, dr), False),
+
+        ("DR", "Recovery shares and threshold (DR)",
+         "vault status -format=json",
+         "Recovery shares and threshold are returned by vault status.",
+         ["Confirm shares and threshold match approved recovery design."],
+         lambda: check_recovery(runner, dr), False),
+
+        ("DR", "TLS certificate (DR)",
+         "TLS handshake to DR Vault address",
+         "Certificate expiry is at least 60 days away.",
+         ["Confirm certificate expiry date."],
+         lambda: check_tls(context["profile"]["dr_addr"]), False)
+    ]
+
+    if context["profile"].get("provider") != "aws" or context["aws_enabled"]:
+        checks.insert(
+            12,
+            (
+                "Primary", "Latest raft snapshots (Primary)",
+                "aws s3api list-objects-v2 --bucket <configured-bucket> "
+                "--prefix <configured-prefix> --output json",
+                "Latest 3 raft snapshots are found in cloud storage.",
+                ["Confirm latest snapshot timestamps are after AMI activity."],
+                lambda: check_cloud_snapshots(runner, context),
+                False
             )
         )
+    else:
+        context["manual_items"].append({
+            "title": "Latest raft snapshots (Primary)",
+            "command": "aws s3api list-objects-v2 --bucket "
+            "<configured-bucket> --prefix <configured-prefix> --output json",
+            "reason": context["aws_skip_reason"],
+            "steps": [
+                "Open the configured S3 bucket and raft-snapshots prefix.",
+                "Confirm latest three snapshot timestamps are after AMI activity."
+            ]
+        })
 
-        if len(output) >= 5:
-            break
+    for index, item in enumerate(checks, 1):
+        print("[{0}/{1}] {2}".format(index, len(checks), item[1]))
+        execute(
+            results, item[0], item[1], item[2],
+            item[3], item[4], item[5], item[6]
+        )
 
-    return " | ".join(output) if output else "No additional evidence."
+    return results
 
 
-def metric_card(label, value, tone=None):
-    shown = "N/A" if value is None or value == "" else str(value)
-    border = ""
+def redact(value, key=""):
+    sensitive = [
+        "token", "password", "secret_id",
+        "access_key", "private_key"
+    ]
 
-    if tone:
-        border = ' style="border-top:4px solid {0};"'.format(tone)
+    if any(item in str(key).lower() for item in sensitive):
+        return "***"
 
+    if isinstance(value, dict):
+        return dict(
+            (name, redact(item, name))
+            for name, item in value.items()
+        )
+
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+
+    return value
+
+
+def pretty_json(value):
+    return json.dumps(
+        redact(value),
+        indent=2,
+        sort_keys=True,
+        default=str
+    )
+
+
+def score(results, section):
+    items = [item for item in results if item.section == section]
+    good = [item for item in items if item.outcome == "verified"]
+    return len(good), len(items)
+
+
+def find_result(results, title):
+    for result in results:
+        if result.title == title:
+            return result
+    return None
+
+
+def assessment(results, title, key, default="Not reported"):
+    result = find_result(results, title)
+
+    if not result or not isinstance(result.evidence, dict):
+        return default
+
+    data = result.evidence.get("assessment", {})
+
+    if not isinstance(data, dict):
+        return default
+
+    return str(data.get(key, default))
+
+
+def state(results, title):
+    result = find_result(results, title)
+
+    if result and result.outcome == "verified":
+        return "Evidence captured"
+
+    return "Manual review"
+
+
+def overview_row(label, value, detail=""):
     return """
-    <div class="metric-card"{0}>
-      <div class="metric-label">{1}</div>
-      <div class="metric-value">{2}</div>
+    <div class="row">
+      <div><b>{0}</b><small>{1}</small></div>
+      <strong>{2}</strong>
     </div>
     """.format(
-        border,
-        escape(label),
-        escape(shown)
+        html.escape(label),
+        html.escape(detail),
+        html.escape(str(value))
     )
 
 
-def report_row(item):
-    return """
-    <tr>
-      <td>{0}</td>
-      <td>{1}</td>
-      <td><strong>{2}</strong></td>
-      <td><span class="badge" style="background:{3};">{4}</span></td>
-      <td>{5}</td>
-      <td>{6}</td>
-      <td>{7}s</td>
-    </tr>
-    """.format(
-        escape(item.scope),
-        escape(item.category),
-        escape(item.name),
-        status_color(item.status),
-        escape(display_status(item.status)),
-        escape(item.details),
-        escape(evidence_summary(item.evidence)),
-        escape(str(item.duration_seconds))
-    )
-
-
-def cluster_panel(title, status, raft, replication, wal_field):
-    status_label = "N/A"
-    initialized = "N/A"
-    sealed = "N/A"
-    peers = "N/A"
-    wal = "N/A"
-
-    if status:
-        status_label = display_status(status.status)
-        initialized = status.evidence.get("initialized")
-        sealed = status.evidence.get("sealed")
-
-    if raft:
-        peers = raft.evidence.get("peer_count")
-
-    if replication:
-        wal = replication.evidence.get(wal_field)
-
-    return """
-    <section class="cluster-panel">
-      <h3>{0}</h3>
-      <div class="cluster-line"><span>Status</span><strong>{1}</strong></div>
-      <div class="cluster-line"><span>Initialized</span><strong>{2}</strong></div>
-      <div class="cluster-line"><span>Sealed</span><strong>{3}</strong></div>
-      <div class="cluster-line"><span>Raft peers</span><strong>{4}</strong></div>
-      <div class="cluster-line"><span>Replication index</span><strong>{5}</strong></div>
-    </section>
-    """.format(
-        escape(title),
-        escape(str(status_label)),
-        escape(str(initialized)),
-        escape(str(sealed)),
-        escape(str(peers)),
-        escape(str(wal))
-    )
-
-
-def render_html_report(environment, validation_label, config, results, metadata):
-    overall = overall_status(results)
-    primary_score = score(results, PRIMARY_SCOPE)
-    dr_score = score(results, DR_SCOPE)
-
-    primary_status = find_result(
-        results,
-        "Vault status (primary)",
-        PRIMARY_SCOPE
-    )
-    dr_status = find_result(
-        results,
-        "Vault status (dr)",
-        DR_SCOPE
-    )
-    primary_raft = find_result(
-        results,
-        "Raft peers (primary)",
-        PRIMARY_SCOPE
-    )
-    dr_raft = find_result(
-        results,
-        "Raft peers (dr)",
-        DR_SCOPE
-    )
-    primary_replication = find_result(
-        results,
-        "Replication status",
-        PRIMARY_SCOPE
-    )
-    dr_replication = find_result(
-        results,
-        "Replication status",
-        DR_SCOPE
-    )
-    cloud_snapshots = find_result(
-        results,
-        "Latest cloud snapshots",
-        PRIMARY_SCOPE
-    )
-    license_status = find_result(
-        results,
-        "Vault license status",
-        PRIMARY_SCOPE
-    )
-
-    metrics = [
-        metric_card(
-            "Overall Result",
-            display_status(overall),
-            status_color(overall)
-        ),
-        metric_card(
-            "Primary Score",
-            "{0}/{1}".format(
-                primary_score["passed"],
-                primary_score["total"]
-            ),
-            "#0f766e"
-        ),
-        metric_card(
-            "DR Score",
-            "{0}/{1}".format(
-                dr_score["passed"],
-                dr_score["total"]
-            ),
-            "#0f766e"
-        ),
-        metric_card(
-            "Primary Raft Peers",
-            primary_raft.evidence.get("peer_count")
-            if primary_raft else None
-        ),
-        metric_card(
-            "DR Raft Peers",
-            dr_raft.evidence.get("peer_count")
-            if dr_raft else None
-        ),
-        metric_card(
-            "License Days Remaining",
-            license_status.evidence.get("days_remaining")
-            if license_status else None
-        ),
-        metric_card(
-            "Latest Snapshot",
-            cloud_snapshots.evidence.get("snapshots", [{}])[0].get(
-                "last_modified"
+def cluster_overview(results, context):
+    primary = "".join([
+        overview_row("Vault endpoint", context["profile"]["primary_addr"]),
+        overview_row(
+            "Vault status",
+            state(results, "Vault status (Primary)"),
+            "Initialized: {0} | Sealed: {1}".format(
+                assessment(results, "Vault status (Primary)", "initialized"),
+                assessment(results, "Vault status (Primary)", "sealed")
             )
-            if cloud_snapshots and cloud_snapshots.evidence.get("snapshots")
-            else None
+        ),
+        overview_row(
+            "Raft topology",
+            state(results, "Raft list-peers (Primary)"),
+            "{0} peers | {1} leader | {2} followers".format(
+                assessment(results, "Raft list-peers (Primary)", "peer_count"),
+                assessment(results, "Raft list-peers (Primary)", "leader_count"),
+                assessment(results, "Raft list-peers (Primary)", "follower_count")
+            )
+        ),
+        overview_row(
+            "Replication",
+            state(results, "DR replication state (Primary)"),
+            "Mode: {0} | State: {1}".format(
+                assessment(results, "DR replication state (Primary)", "mode"),
+                assessment(results, "DR replication state (Primary)", "state")
+            )
         )
-    ]
+    ])
 
-    failures = [
-        item for item in results
-        if item.status == "FAIL"
-    ]
+    dr = "".join([
+        overview_row("Vault endpoint", context["profile"]["dr_addr"]),
+        overview_row(
+            "Vault status",
+            state(results, "Vault status (DR)"),
+            "Initialized: {0} | Sealed: {1}".format(
+                assessment(results, "Vault status (DR)", "initialized"),
+                assessment(results, "Vault status (DR)", "sealed")
+            )
+        ),
+        overview_row(
+            "Raft topology",
+            state(results, "Raft list-peers (DR)"),
+            "{0} peers | {1} leader | {2} followers".format(
+                assessment(results, "Raft list-peers (DR)", "peer_count"),
+                assessment(results, "Raft list-peers (DR)", "leader_count"),
+                assessment(results, "Raft list-peers (DR)", "follower_count")
+            )
+        ),
+        overview_row(
+            "Replication",
+            state(results, "DR replication state (DR)"),
+            "Mode: {0} | State: {1}".format(
+                assessment(results, "DR replication state (DR)", "mode"),
+                assessment(results, "DR replication state (DR)", "state")
+            )
+        )
+    ])
 
-    exceptions = """
-    <div class="exception exception-pass">
-      <h3>Validation Summary</h3>
-      <p>All automated validation checks completed successfully.</p>
+    return """
+    <div class="clusters">
+      <article><header>Primary Cluster</header>{0}</article>
+      <article><header>DR Cluster</header>{1}</article>
     </div>
-    """
+    """.format(primary, dr)
 
-    if failures:
-        exceptions = """
-        <div class="exception exception-fail">
-          <h3>Validation Failures</h3>
-          <ul>{0}</ul>
-        </div>
-        """.format(
-            "".join([
-                "<li><strong>{0}</strong>: {1}</li>".format(
-                    escape(item.name),
-                    escape(item.details)
-                )
-                for item in failures
-            ])
-        )
 
-    snapshot = get_snapshot_config(config)
+def render_context(context):
+    cloud = "Included"
 
-    context = [
-        ("Cloud", config.get("cloud", "").upper()),
-        ("Tier", config.get("tier", "N/A")),
-        ("Primary Vault Address", config.get("primary", {}).get("vault_addr")),
-        ("DR Vault Address", config.get("dr", {}).get("vault_addr")),
-        ("Test Secret Path", metadata.get("test_secret_path")),
-        ("Snapshot Bucket", snapshot.get("bucket")),
-        ("Snapshot Prefix", snapshot.get("prefix")),
-        ("Transcript File", metadata.get("transcript_path"))
+    if context["profile"].get("provider") == "aws" and not context["aws_enabled"]:
+        cloud = "Manual verification required"
+
+    values = [
+        ("Environment", context["environment"]),
+        ("Provider", context["profile"].get("provider", "").upper()),
+        ("Validation label", context["label"]),
+        ("Generated UTC", context["timestamp"]),
+        ("Test secret path", context["test_path"]),
+        ("Snapshot validation", cloud)
     ]
 
-    context_cards = []
-    for label, value in context:
-        context_cards.append("""
-        <div class="context-card">
-          <div class="context-label">{0}</div>
-          <div class="context-value">{1}</div>
+    return "".join([
+        """
+        <div class="context">
+          <span>{0}</span>
+          <strong>{1}</strong>
         </div>
-        """.format(
-            escape(label),
-            escape(str(value or "N/A"))
-        ))
+        """.format(html.escape(label), html.escape(str(value)))
+        for label, value in values
+    ])
 
-    template = Template("""
-<!DOCTYPE html>
-<html lang="en">
+
+def render_card(result, number):
+    style = "good" if result.outcome == "verified" else "review"
+    note = ""
+
+    if result.outcome != "verified":
+        note = """
+        <div class="note"><b>Review note:</b> {0}</div>
+        """.format(html.escape(result.error))
+
+    return """
+    <article class="check {0}">
+      <div class="check-head">
+        <div>
+          <span class="number">{1:02d}</span>
+          <h3>{2}</h3>
+          <p>{3}</p>
+        </div>
+      </div>
+      <div class="condition">
+        <span>Outcome</span>
+        <strong>{4}</strong>
+      </div>
+      {5}
+      <details open>
+        <summary>View JSON evidence</summary>
+        <pre>{6}</pre>
+      </details>
+    </article>
+    """.format(
+        style,
+        number,
+        html.escape(result.title),
+        html.escape(result.command),
+        html.escape(result.condition),
+        note,
+        html.escape(pretty_json(result.evidence))
+    )
+
+
+def manual_cards(results, context):
+    items = list(context["manual_items"])
+
+    for result in results:
+        if result.outcome != "verified":
+            items.append({
+                "title": result.title,
+                "command": result.command,
+                "reason": result.error,
+                "steps": result.steps
+            })
+
+    items.append({
+        "title": "Concourse daily maintenance certificate pipeline",
+        "command": "Manual Concourse validation",
+        "reason": "This pipeline is intentionally not triggered by the script.",
+        "steps": [
+            "Open Concourse Daily Maintenance for the selected environment.",
+            "Run the Check Certificate pipeline.",
+            "Confirm the pipeline succeeds.",
+            "Attach the successful build URL to the change record."
+        ]
+    })
+
+    output = ""
+
+    for item in items:
+        steps = "".join([
+            "<li>{0}</li>".format(html.escape(step))
+            for step in item["steps"]
+        ])
+
+        output += """
+        <article class="manual">
+          <h3>{0}</h3>
+          <code>{1}</code>
+          <p>{2}</p>
+          <ol>{3}</ol>
+        </article>
+        """.format(
+            html.escape(item["title"]),
+            html.escape(item["command"]),
+            html.escape(item["reason"]),
+            steps
+        )
+
+    return output
+
+
+HTML = Template("""<!doctype html>
+<html>
 <head>
 <meta charset="utf-8">
-<title>Vault Validation Report - $environment</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vault Validation - $environment</title>
 <style>
-body {
-  margin: 0;
-  background: #edf4f7;
-  color: #102a43;
-  font-family: "Segoe UI", Arial, sans-serif;
-}
-.page {
-  width: 94%;
-  max-width: 1480px;
-  margin: 0 auto;
-  padding: 30px 0 44px;
-}
-.hero {
-  padding: 34px;
-  border-radius: 26px;
-  color: #ffffff;
-  background: linear-gradient(125deg, #062f3c 0%, #0e7490 52%, #164e63 100%);
-  box-shadow: 0 20px 50px rgba(8, 47, 73, 0.25);
-}
-.hero h1 {
-  margin: 0 0 10px;
-  font-size: 34px;
-}
-.hero p {
-  margin: 6px 0;
-  color: rgba(255, 255, 255, 0.91);
-}
-.overall {
-  display: inline-block;
-  margin-top: 16px;
-  padding: 11px 18px;
-  border-radius: 100px;
-  background: $overall_color;
-  color: white;
-  font-size: 15px;
-  font-weight: 700;
-}
-.section {
-  margin-top: 20px;
-  padding: 24px;
-  border: 1px solid #d8e3e9;
-  border-radius: 22px;
-  background: #ffffff;
-  box-shadow: 0 9px 25px rgba(15, 42, 67, 0.06);
-}
-.section h2 {
-  margin: 0 0 16px;
-  color: #082f49;
-  font-size: 22px;
-}
-.metric-grid, .context {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 14px;
-}
-.cluster-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-  gap: 16px;
-}
-.metric-card, .context-card, .cluster-panel {
-  padding: 16px;
-  border: 1px solid #dce8ed;
-  border-radius: 16px;
-  background: linear-gradient(180deg, #ffffff, #f7fbfc);
-}
-.metric-label, .context-label {
-  color: #5d7484;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-}
-.metric-value {
-  margin-top: 9px;
-  color: #0c3b50;
-  font-size: 23px;
-  font-weight: 800;
-  overflow-wrap: anywhere;
-}
-.context-value {
-  margin-top: 7px;
-  color: #102a43;
-  font-size: 14px;
-  font-weight: 600;
-  overflow-wrap: anywhere;
-}
-.cluster-panel h3 {
-  margin: 0 0 13px;
-  color: #0b5568;
-  font-size: 19px;
-}
-.cluster-line {
-  display: flex;
-  justify-content: space-between;
-  gap: 15px;
-  padding: 10px 0;
-  border-top: 1px solid #dfeaec;
-}
-.cluster-line:first-of-type {
-  border-top: 0;
-}
-.cluster-line span {
-  color: #5d7484;
-}
-.cluster-line strong {
-  color: #102a43;
-  text-align: right;
-}
-.exception {
-  padding: 16px 18px;
-  border-radius: 15px;
-}
-.exception h3 {
-  margin: 0 0 9px;
-}
-.exception p, .exception ul {
-  margin: 0;
-}
-.exception-fail {
-  border: 1px solid #fed7aa;
-  background: #fff7ed;
-  color: #9a3412;
-}
-.exception-pass {
-  border: 1px solid #bbf7d0;
-  background: #f0fdf4;
-  color: #166534;
-}
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-}
-th, td {
-  padding: 13px 11px;
-  border-bottom: 1px solid #deeaed;
-  text-align: left;
-  vertical-align: top;
-}
-th {
-  background: #ecf6f8;
-  color: #31566a;
-  font-size: 11px;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-}
-tr:nth-child(even) td {
-  background: #fbfdfe;
-}
-.badge {
-  display: inline-block;
-  padding: 6px 9px;
-  border-radius: 99px;
-  color: white;
-  font-size: 11px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-.footer {
-  padding-top: 20px;
-  color: #607d8b;
-  font-size: 12px;
-  text-align: center;
-}
+:root{--navy:#071c35;--teal:#008f88;--gold:#bf7912;--ink:#193047;--muted:#60758a;--line:#d8e4ea;--paper:#eef5f7}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:Georgia,serif}.wrap{width:min(1220px,94%);margin:auto}
+body>header{padding:46px 0;background:linear-gradient(120deg,#071c35,#0b3458,#0c5b60);border-bottom:6px solid var(--teal);color:#fff}.eyebrow{color:#8fe9e1;font:700 11px Arial;letter-spacing:.16em;text-transform:uppercase}h1{margin:7px 0;font-size:38px;font-weight:normal}.meta{font:14px Arial;color:#c9dfeb}.scores{display:flex;gap:16px;margin-top:27px}.score{min-width:235px;padding:17px 20px;border:1px solid #51809a;background:#ffffff12}.score span,.context span{display:block;font:700 10px Arial;letter-spacing:.12em;text-transform:uppercase}.score span{color:#c9e2ee}.score strong{display:block;font-size:36px;font-weight:normal}main{padding:35px 0}.heading{display:flex;gap:12px;align-items:baseline;border-bottom:2px solid var(--ink);margin:35px 0 18px;padding-bottom:10px}.heading h2{margin:0;font-size:28px;font-weight:normal}.heading span{color:var(--muted);font:700 10px Arial;letter-spacing:.12em;text-transform:uppercase}.clusters{display:grid;grid-template-columns:1fr 1fr;gap:20px}.clusters article,.context-grid,.check{background:#fff;border:1px solid var(--line);box-shadow:0 8px 20px #19304712}.clusters header{padding:16px 19px;background:var(--navy);color:#fff;font:normal 20px Georgia}.row{display:flex;justify-content:space-between;gap:20px;padding:13px 19px;border-top:1px solid var(--line)}.row b,.row small{display:block;font:700 12px Arial}.row small{margin-top:3px;color:var(--muted);font-weight:normal}.row strong{max-width:52%;font:600 12px Arial;text-align:right;overflow-wrap:anywhere}.context-grid{display:grid;grid-template-columns:repeat(3,1fr)}.context{min-height:93px;padding:18px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.context span{color:var(--muted)}.context strong{display:block;margin-top:8px;overflow-wrap:anywhere}.check{margin:13px 0;padding:20px;border-left:5px solid var(--teal)}.check.review{border-left-color:var(--gold)}.check-head{display:flex;justify-content:space-between}.number{color:var(--teal);font:700 12px Arial;letter-spacing:.1em}.review .number{color:var(--gold)}h3{display:inline;margin-left:10px;font-size:20px;font-weight:normal}.check-head p{margin:8px 0 0;color:var(--muted);font:12px Consolas,monospace;overflow-wrap:anywhere}.condition{margin:17px 0 0 25px;padding:10px 13px;background:#e5f6f3;border-left:3px solid var(--teal);font:13px Arial}.review .condition{background:#fff3dc;border-left-color:var(--gold)}.condition span{margin-right:10px;color:var(--muted);font:700 10px Arial;letter-spacing:.1em;text-transform:uppercase}.note{margin:14px 0;padding:10px;color:#805002;background:#fff6e6;font:13px Arial}details{margin-top:16px}summary{cursor:pointer;font:700 12px Arial;color:#173e5d}pre{max-height:340px;overflow:auto;margin:12px 0 0;padding:15px;border-radius:3px;background:#0d2743;color:#e7f0f7;font:12px/1.5 Consolas,monospace}.manuals{padding:24px;background:#fff9ed;border:1px solid #ecd49f}.manual{padding:17px 0;border-top:1px solid #ead7b0}.manual:first-child{border-top:0}.manual h3{margin:0;color:#693f05}.manual code{display:block;margin:9px 0;color:#715326;overflow-wrap:anywhere}.manual p,.manual ol{font:13px Arial}.manual ol{padding-left:20px}@media(max-width:700px){.clusters,.context-grid{grid-template-columns:1fr}.scores{display:block}.score{margin:10px 0}.row{display:block}.row strong{display:block;max-width:100%;margin-top:7px;text-align:left}}
 </style>
 </head>
 <body>
-<main class="page">
-  <section class="hero">
-    <h1>Vault AMI Validation Report</h1>
-    <p>Infrastructure validation summary for engineering and leadership review.</p>
-    <p>Environment: <strong>$environment</strong> | Validation: <strong>$validation_label</strong></p>
-    <p>Generated: <strong>$timestamp</strong></p>
-    <div class="overall">Overall Result: $overall_label</div>
-  </section>
-
-  <section class="section">
-    <h2>Executive Summary</h2>
-    <div class="metric-grid">$metrics</div>
-  </section>
-
-  <section class="section">
-    <h2>Cluster Overview</h2>
-    <div class="cluster-grid">
-      $primary_panel
-      $dr_panel
-    </div>
-  </section>
-
-  <section class="section">
-    <h2>Exceptions and Follow-up</h2>
-    $exceptions
-  </section>
-
-  <section class="section">
-    <h2>Run Context</h2>
-    <div class="context">$context_cards</div>
-  </section>
-
-  <section class="section">
-    <h2>Validation Results</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Scope</th>
-          <th>Category</th>
-          <th>Check</th>
-          <th>Status</th>
-          <th>Outcome</th>
-          <th>Evidence</th>
-          <th>Duration</th>
-        </tr>
-      </thead>
-      <tbody>$rows</tbody>
-    </table>
-  </section>
-
-  <div class="footer">
-    Full command output is retained in the transcript file. Token values are never included in the HTML or JSON report.
-  </div>
+<header><div class="wrap">
+<div class="eyebrow">Vault AMI Validation</div>
+<h1>$environment</h1>
+<div class="meta">Run label: $label | Generated: $timestamp UTC</div>
+<div class="scores">
+<div class="score"><span>Primary score</span><strong>$primary_score / $primary_total</strong></div>
+<div class="score"><span>DR score</span><strong>$dr_score / $dr_total</strong></div>
+</div>
+</div></header>
+<main class="wrap">
+<div class="heading"><h2>Cluster Overview</h2><span>Primary and DR posture</span></div>
+$overview
+<div class="heading"><h2>Run Context</h2><span>Execution details</span></div>
+<div class="context-grid">$context</div>
+<div class="heading"><h2>Primary Validation Results</h2><span>Command evidence</span></div>
+$primary
+<div class="heading"><h2>DR Validation Results</h2><span>Command evidence</span></div>
+$dr
+<div class="heading"><h2>Manual Verification Required</h2><span>Follow-up actions</span></div>
+<div class="manuals">$manual</div>
 </main>
 </body>
-</html>
-""")
+</html>""")
 
-    return template.substitute(
-        environment=escape(environment),
-        validation_label=escape(validation_label),
-        timestamp=escape(metadata["timestamp_utc"]),
-        overall_color=status_color(overall),
-        overall_label=escape(display_status(overall)),
-        metrics="".join(metrics),
-        primary_panel=cluster_panel(
-            "Primary Cluster",
-            primary_status,
-            primary_raft,
-            primary_replication,
-            "last_wal"
-        ),
-        dr_panel=cluster_panel(
-            "DR Cluster",
-            dr_status,
-            dr_raft,
-            dr_replication,
-            "last_remote_wal"
-        ),
-        exceptions=exceptions,
-        context_cards="".join(context_cards),
-        rows="".join([report_row(item) for item in results])
+
+def create_report(results, context):
+    primary = [item for item in results if item.section == "Primary"]
+    dr = [item for item in results if item.section == "DR"]
+
+    primary_score, primary_total = score(results, "Primary")
+    dr_score, dr_total = score(results, "DR")
+
+    return HTML.substitute(
+        environment=html.escape(context["environment"]),
+        label=html.escape(context["label"]),
+        timestamp=html.escape(context["timestamp"]),
+        primary_score=primary_score,
+        primary_total=primary_total,
+        dr_score=dr_score,
+        dr_total=dr_total,
+        overview=cluster_overview(results, context),
+        context=render_context(context),
+        primary="".join([
+            render_card(item, index + 1)
+            for index, item in enumerate(primary)
+        ]),
+        dr="".join([
+            render_card(item, index + 1)
+            for index, item in enumerate(dr)
+        ]),
+        manual=manual_cards(results, context)
     )
 
 
+def save_report(report, context):
+    folder = os.path.join(REPORT_DIR, context["environment"])
+
+    if not os.path.isdir(folder):
+        os.makedirs(folder)
+
+    path = os.path.join(
+        folder,
+        "vault_ami_validation_{0}_{1}.html".format(
+            context["environment"],
+            context["timestamp"]
+        )
+    )
+
+    with open(path, "w") as output:
+        output.write(report)
+
+    return path
+def print_cli_summary(results):
+    print("\n" + "=" * 72)
+    print("VALIDATION SUMMARY")
+    print("=" * 72)
+
+    for section in ["Primary", "DR"]:
+        print("\n{0}:".format(section))
+
+        section_results = [
+            result for result in results
+            if result.section == section
+        ]
+
+        for result in section_results:
+            if result.outcome == "verified":
+                print("  [PASSED] {0}".format(result.title))
+            else:
+                print("  [FAILED] {0}".format(result.title))
+                print("           Reason: {0}".format(
+                    result.error or "Manual verification required."
+                ))
+
+        passed = len([
+            result for result in section_results
+            if result.outcome == "verified"
+        ])
+
+        failed = len(section_results) - passed
+
+        print("  Total: {0} passed, {1} failed".format(
+            passed,
+            failed
+        ))
+
+    print("\n" + "=" * 72)
+
+
 def main():
-    script_dir = Path(__file__).resolve().parent
-    config_path = script_dir / "vault_validation_config.json"
-
-    if not config_path.exists():
-        print(
-            "Config file not found: {0}".format(config_path),
-            file=sys.stderr
-        )
-        return 2
+    print("Vault AMI Validation")
 
     try:
-        full_config = json.loads(
-            config_path.read_text(encoding="utf-8")
-        )
-    except ValueError as exc:
-        print("Config JSON is invalid: {0}".format(exc), file=sys.stderr)
-        return 2
+        context = get_context()
+        results = run_validations(context)
+        path = save_report(create_report(results, context), context)
+        print_cli_summary(results)
 
-    runner = None
+        primary_good, primary_total = score(results, "Primary")
+        dr_good, dr_total = score(results, "DR")
 
-    try:
-        print("\nVault AMI Validation")
-        print("=" * 48)
-
-        environment = prompt_environment(full_config)
-        validation_label = prompt_validation_label()
-        environment_config = full_config["environments"][environment]
-
-        validate_config(environment, environment_config)
-
-        cloud = environment_config["cloud"].lower()
-        report_dir = script_dir / "reports" / environment
-        report_dir.mkdir(parents=True, exist_ok=True)
-
-        require_command("vault")
-        require_command("openssl")
-
-        if cloud == "aws":
-            require_command("aws")
-
-        if cloud == "gcp":
-            require_command("gsutil")
-
-        base_env = dict(os.environ)
-        credentials = collect_runtime_credentials(cloud, base_env)
-
-        primary_env = build_env(
-            base_env,
-            vault_addr=environment_config["primary"]["vault_addr"],
-            vault_token=credentials["primary_token"]
-        )
-
-        dr_env = build_env(
-            base_env,
-            vault_addr=environment_config["dr"]["vault_addr"],
-            vault_token=credentials["dr_token"]
-        )
-
-        dr_operation_env = build_env(
-            base_env,
-            vault_addr=environment_config["dr"]["vault_addr"]
-        )
-
-        command_timeout = environment_config.get(
-            "command_timeout_seconds",
-            DEFAULT_COMMAND_TIMEOUT
-        )
-
-        transcript_path = report_dir / (
-            "vault_validation_transcript_{0}_{1}.log".format(
-                environment,
-                utc_now_str()
-            )
-        )
-
-        runner = CommandRunner(transcript_path, command_timeout)
-
-        snapshot = get_snapshot_config(environment_config)
-
-        print("\nRunning critical credential prechecks...")
-        check_primary_token(runner, primary_env)
-        check_dr_operation_token(
-            runner,
-            dr_operation_env,
-            credentials["dr_token"]
-        )
-
-        if cloud == "aws":
-            check_aws_credentials(runner, credentials["aws_env"])
-
-        if cloud == "gcp":
-            check_gcp_credentials(
-                runner,
-                credentials["gcp_env"],
-                snapshot["bucket"]
-            )
-
-        runtime = {
-            "test_secret_path": create_test_secret_path(
-                environment_config.get(
-                    "test_secret_base_path",
-                    "kvtest/test"
-                ),
-                validation_label
-            )
-        }
-
-        results = []
-        status_cache = {}
-        expected_peers = environment_config.get("expected_raft_peers", 5)
-        license_warning_days = environment_config.get(
-            "license_warning_days",
-            60
-        )
-        certificate_warning_days = environment_config.get(
-            "certificate_warning_days",
-            60
-        )
-
-        # Primary cluster: 16 checks
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Vault status (primary)", "Cluster Health",
-            lambda: check_vault_status(
-                runner, primary_env, "Primary", status_cache, "primary"
-            )
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Raft peers (primary)", "Raft",
-            lambda: check_raft_peers(
-                runner, primary_env, "Primary", expected_peers
-            )
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Autopilot config (primary)", "Raft",
-            lambda: check_autopilot(runner, primary_env, "Primary")
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Write test secret", "Functional",
-            lambda: check_test_secret_write(runner, primary_env, runtime)
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Read test secret", "Functional",
-            lambda: check_test_secret_read(runner, primary_env, runtime)
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Auto snapshot config", "Snapshots",
-            lambda: check_snapshot_config(
-                runner, primary_env, environment_config
-            )
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Auto snapshot status", "Snapshots",
-            lambda: check_snapshot_status(
-                runner, primary_env, environment_config
-            )
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Replication status", "Replication",
-            lambda: check_primary_replication(runner, primary_env)
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Operator members", "Cluster Health",
-            lambda: check_operator_members(
-                runner, primary_env, expected_peers
-            )
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Secrets, auth, and policy counts", "Inventory",
-            lambda: check_vault_inventory(runner, primary_env)
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Vault license status", "Compliance",
-            lambda: check_license(
-                runner, primary_env, license_warning_days
-            )
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Audit devices", "Compliance",
-            lambda: check_audit_devices(runner, primary_env)
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Latest cloud snapshots", "Snapshots",
-            lambda: check_cloud_snapshots(
-                runner,
-                environment_config,
-                credentials["aws_env"],
-                credentials["gcp_env"]
-            )
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Vault version", "Cluster Health",
-            lambda: check_vault_version(
-                status_cache, "primary", "Primary"
-            )
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "Recovery shares and threshold", "Cluster Health",
-            lambda: check_recovery_info(
-                status_cache, "primary", "Primary"
-            )
-        )
-        safe_run_check(
-            results, PRIMARY_SCOPE, "SSL certificate", "Compliance",
-            lambda: check_ssl_certificate(
-                runner,
-                environment_config["primary"].get(
-                    "ssl_address",
-                    environment_config["primary"]["vault_addr"]
-                ),
-                "Primary",
-                certificate_warning_days
-            )
-        )
-
-        # DR cluster: 7 checks
-        safe_run_check(
-            results, DR_SCOPE, "Vault status (dr)", "Cluster Health",
-            lambda: check_vault_status(
-                runner, dr_env, "DR", status_cache, "dr"
-            )
-        )
-        safe_run_check(
-            results, DR_SCOPE, "Raft peers (dr)", "Raft",
-            lambda: check_raft_peers(
-                runner,
-                dr_operation_env,
-                "DR",
-                expected_peers,
-                credentials["dr_token"]
-            )
-        )
-        safe_run_check(
-            results, DR_SCOPE, "Autopilot config (dr)", "Raft",
-            lambda: check_autopilot(
-                runner,
-                dr_operation_env,
-                "DR",
-                credentials["dr_token"]
-            )
-        )
-        safe_run_check(
-            results, DR_SCOPE, "Replication status", "Replication",
-            lambda: check_dr_replication(runner, dr_env)
-        )
-        safe_run_check(
-            results, DR_SCOPE, "Vault version", "Cluster Health",
-            lambda: check_vault_version(status_cache, "dr", "DR")
-        )
-        safe_run_check(
-            results, DR_SCOPE, "Recovery shares and threshold", "Cluster Health",
-            lambda: check_recovery_info(status_cache, "dr", "DR")
-        )
-        safe_run_check(
-            results, DR_SCOPE, "SSL certificate", "Compliance",
-            lambda: check_ssl_certificate(
-                runner,
-                environment_config["dr"].get(
-                    "ssl_address",
-                    environment_config["dr"]["vault_addr"]
-                ),
-                "DR",
-                certificate_warning_days
-            )
-        )
-
-        runner.close()
-
-        timestamp = utc_now().isoformat() + "Z"
-        overall = overall_status(results)
-
-        metadata = {
-            "timestamp_utc": timestamp,
-            "validation_label": validation_label,
-            "test_secret_path": runtime["test_secret_path"],
-            "transcript_path": str(transcript_path)
-        }
-
-        report = {
-            "environment": environment,
-            "validation_label": validation_label,
-            "timestamp_utc": timestamp,
-            "overall_status": overall,
-            "metadata": metadata,
-            "scores": {
-                "primary": score(results, PRIMARY_SCOPE),
-                "dr": score(results, DR_SCOPE)
-            },
-            "results": [item.to_dict() for item in results]
-        }
-
-        report_name = "vault_validation_report_{0}_{1}".format(
-            environment,
-            utc_now_str()
-        )
-
-        json_path = report_dir / (report_name + ".json")
-        html_path = report_dir / (report_name + ".html")
-
-        json_path.write_text(
-            json.dumps(report, indent=2),
-            encoding="utf-8"
-        )
-
-        html_path.write_text(
-            render_html_report(
-                environment,
-                validation_label,
-                environment_config,
-                results,
-                metadata
-            ),
-            encoding="utf-8"
-        )
-
-        print("\n" + ("=" * 48))
-        print("Overall result: {0}".format(display_status(overall)))
-
-        for result in results:
-            print(
-                "[{0}] {1} - {2}: {3}".format(
-                    display_status(result.status),
-                    result.scope,
-                    result.name,
-                    result.details
-                )
-            )
-
-        print("\nHTML report: {0}".format(html_path))
-        print("JSON report: {0}".format(json_path))
-        print("Command transcript: {0}".format(transcript_path))
-
-        return 1 if overall == "FAIL" else 0
+        print("\nReport created: {0}".format(path))
+        print("Primary score: {0}/{1}".format(
+            primary_good, primary_total
+        ))
+        print("DR score: {0}/{1}".format(dr_good, dr_total))
 
     except ValidationError as exc:
-        if runner:
-            runner.close()
-
-        print(
-            "\nCritical setup failure: {0}".format(exc),
-            file=sys.stderr
-        )
-        return 2
+        print("\nUnable to start validation: {0}".format(exc))
+        sys.exit(2)
 
     except KeyboardInterrupt:
-        if runner:
-            runner.close()
-
-        print("\nValidation cancelled by user.", file=sys.stderr)
-        return 130
+        print("\nValidation cancelled.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
