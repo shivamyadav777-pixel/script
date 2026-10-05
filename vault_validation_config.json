@@ -1,23 +1,59 @@
 {
   "environments": {
-    "le1": {
-      "kv_test_path": "kvtest/test",
-      "aws_profile": "",
-      "aws_region": "us-east-1",
-      "snapshot_retry_attempts": 4,
-      "snapshot_retry_delay_seconds": 15,
-      "maintenance_pipelines": [
-        "<le1_pipeline_1>",
-        "<le1_pipeline_2>"
-      ],
-      "primary": {
-        "vault_addr": "https://<le1-primary-vault-url>",
-        "snapshot_bucket": "vault-inc-primary-raft-snapshots",
-        "snapshot_prefix": "raft-snapshots/"
-      },
-      "dr": {
-        "vault_addr": "https://<le1-dr-vault-url>"
-      }
+    "awsle1": {
+      "provider": "aws",
+      "tier": "inc",
+      "primary_addr": "https://PRIMARY-VAULT-ADDRESS:8200",
+      "dr_addr": "https://DR-VAULT-ADDRESS:8200",
+      "snapshot_bucket": "vault-inc-primary-raft-snapshots",
+      "snapshot_prefix": "raft-snapshots/",
+      "test_secret_prefix": "kvtest/test",
+      "snapshot_interval_seconds": 28800,
+      "snapshot_max_age_seconds": 28800
+    },
+    "awsxe1": {
+      "provider": "aws",
+      "tier": "nprd",
+      "primary_addr": "https://PRIMARY-VAULT-ADDRESS:8200",
+      "dr_addr": "https://DR-VAULT-ADDRESS:8200",
+      "snapshot_bucket": "vault-nprd-primary-raft-snapshots",
+      "snapshot_prefix": "raft-snapshots/",
+      "test_secret_prefix": "kvtest/test",
+      "snapshot_interval_seconds": 1800,
+      "snapshot_max_age_seconds": 2400
+    },
+    "awspe1": {
+      "provider": "aws",
+      "tier": "prod",
+      "primary_addr": "https://PRIMARY-VAULT-ADDRESS:8200",
+      "dr_addr": "https://DR-VAULT-ADDRESS:8200",
+      "snapshot_bucket": "vault-prod-primary-raft-snapshots",
+      "snapshot_prefix": "raft-snapshots/",
+      "test_secret_prefix": "kvtest/test",
+      "snapshot_interval_seconds": 1800,
+      "snapshot_max_age_seconds": 2400
+    },
+    "gcpxe1": {
+      "provider": "gcp",
+      "tier": "nprd",
+      "primary_addr": "https://PRIMARY-VAULT-ADDRESS:8200",
+      "dr_addr": "https://DR-VAULT-ADDRESS:8200",
+      "snapshot_bucket": "GCP-SNAPSHOT-BUCKET",
+      "snapshot_prefix": "raft-snapshots/",
+      "test_secret_prefix": "kvtest/test",
+      "snapshot_interval_seconds": 1800,
+      "snapshot_max_age_seconds": 2400
+    },
+    "gcppe1": {
+      "provider": "gcp",
+      "tier": "prod",
+      "primary_addr": "https://PRIMARY-VAULT-ADDRESS:8200",
+      "dr_addr": "https://DR-VAULT-ADDRESS:8200",
+      "snapshot_bucket": "GCP-SNAPSHOT-BUCKET",
+      "snapshot_prefix": "raft-snapshots/",
+      "test_secret_prefix": "kvtest/test",
+      "snapshot_interval_seconds": 1800,
+      "snapshot_max_age_seconds": 2400
     }
   }
 }
