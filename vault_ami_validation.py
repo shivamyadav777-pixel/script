@@ -1039,13 +1039,6 @@ def run_validations(context):
          ["Confirm snapshot interval matches the baseline."],
          lambda: check_snapshot_config(runner, context), False),
 
-        ("Primary", "Snapshot runtime status (Primary)",
-         "vault read -format=json "
-         "sys/storage/raft/snapshot-auto/status/s3",
-         "Latest snapshot is within the configured age limit.",
-         ["Snapshot check retries automatically before requiring follow-up."],
-         lambda: check_snapshot_status(runner, context), False),
-
         ("Primary", "DR replication state (Primary)",
          "vault read -format=json sys/replication/status",
          "Mode is primary, state is running, and connections are connected.",
@@ -1415,9 +1408,8 @@ def manual_cards(results, context):
                 "steps": result.steps
             })
 
-    # Permanent manual retry check.
     items.append({
-        "title": "Snapshot runtime status retry check",
+        "title": "Snapshot runtime status retry validation",
         "command": (
             "for i in 1 2 3 4 5; do "
             "echo \"Snapshot status attempt $i/5\"; "
@@ -1427,13 +1419,13 @@ def manual_cards(results, context):
             "done"
         ),
         "reason": (
-            "Run this after every AMI activity, even when automated "
-            "snapshot validation succeeds."
+            "This is a permanent manual post-AMI validation. "
+            "It is intentionally excluded from the automated score."
         ),
         "steps": [
-            "Run from the approved Dojo terminal.",
-            "Allow up to five attempts with a 60-second wait.",
-            "Confirm the latest snapshot timestamp is recent.",
+            "Run the command from the approved Dojo terminal.",
+            "Allow five attempts with a 60-second wait between attempts.",
+            "Confirm the latest snapshot timestamp is after the AMI activity.",
             "Confirm a next snapshot timestamp is populated."
         ]
     })
@@ -1460,7 +1452,7 @@ def manual_cards(results, context):
 
         output += """
         <article class="manual-card">
-          <span>Required follow-up</span>
+          <span class="manual-label">Required follow-up</span>
           <h3>{0}</h3>
           <code>{1}</code>
           <p>{2}</p>
@@ -1475,7 +1467,6 @@ def manual_cards(results, context):
 
     return output
 
-
 HTML = Template("""<!doctype html>
 <html lang="en">
 <head>
@@ -1483,243 +1474,388 @@ HTML = Template("""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Vault AMI Validation - $environment</title>
 <style>
-:root{
-  --core:#001871;
-  --dark:#001149;
-  --cobalt:#1352DE;
-  --pale-blue:#C7DBF4;
-  --gold:#CE8E49;
-  --pale-gold:#F6EBCF;
-  --blue-gray:#5D738D;
-  --dark-gray:#343741;
-  --pale-gray:#EEEEEE;
-  --white:#FFFFFF;
-  --line:#D7E1EC;
+:root {
+  --core-blue: #001871;
+  --dark-blue: #001149;
+  --cobalt: #1352DE;
+  --pale-blue: #C7DBF4;
+  --pale-gold: #EDD7A0;
+  --pale-gold-soft: #F6EBCF;
+  --blue-gray: #5D738D;
+  --dark-gray: #343741;
+  --light-gray: #EEEEEE;
+  --white: #FFFFFF;
+  --line: #D7E1EC;
 }
-*{box-sizing:border-box}
-body{
-  margin:0;
-  color:var(--dark-gray);
-  background:var(--pale-gray);
-  font-family:"Source Sans 3",Arial,sans-serif;
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  color: var(--dark-gray);
+  background: var(--light-gray);
+  font-family: "Source Sans 3", Arial, sans-serif;
 }
-.wrap{width:min(1220px,94%);margin:auto}
-body>header{
-  color:var(--white);
-  background:linear-gradient(120deg,var(--dark),var(--core) 60%,var(--cobalt));
-  border-bottom:7px solid #EDD7A0;
+
+.wrap {
+  width: min(1220px, 94%);
+  margin: 0 auto;
 }
-.header-inner{padding:48px 0 40px}
-.eyebrow{
-  margin:0 0 10px;
-  color:#EDD7A0;
-  font:700 11px Arial,sans-serif;
-  letter-spacing:.17em;
-  text-transform:uppercase;
+
+body > header {
+  color: var(--white);
+  background: var(--core-blue);
+  border-bottom: 8px solid var(--pale-gold);
 }
-h1{
-  margin:0;
-  font:500 39px "Futura PT","Source Sans 3",Arial,sans-serif;
+
+.header-inner {
+  padding: 52px 0 42px;
 }
-.meta{margin:13px 0 0;color:var(--pale-blue);font-size:14px}
-.score-grid{display:flex;gap:16px;margin-top:31px}
-.score-card{
-  min-width:235px;
-  padding:16px 20px;
-  border-top:3px solid #EDD7A0;
-  background:#ffffff1c;
+
+.eyebrow {
+  margin: 0 0 12px;
+  color: var(--pale-gold);
+  font: 700 11px Arial, sans-serif;
+  letter-spacing: .18em;
+  text-transform: uppercase;
 }
-.score-card span,.context-item span{
-  display:block;
-  font:700 10px Arial,sans-serif;
-  letter-spacing:.13em;
-  text-transform:uppercase;
+
+h1 {
+  max-width: 760px;
+  margin: 0;
+  color: var(--white);
+  font: 500 42px "Futura PT", "Source Sans 3", Arial, sans-serif;
+  line-height: 1.08;
 }
-.score-card span{color:var(--pale-blue)}
-.score-card strong{
-  display:block;
-  margin-top:4px;
-  font:500 38px "Futura PT","Source Sans 3",Arial,sans-serif;
+
+.meta {
+  margin: 16px 0 0;
+  color: var(--pale-blue);
+  font-size: 14px;
 }
-main{padding:34px 0 54px}
-.heading{
-  display:flex;
-  gap:13px;
-  align-items:baseline;
-  margin:38px 0 18px;
-  padding-bottom:10px;
-  border-bottom:3px solid var(--core);
+
+.score-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-top: 34px;
 }
-.heading h2{
-  margin:0;
-  color:var(--dark);
-  font:500 28px "Futura PT","Source Sans 3",Arial,sans-serif;
+
+.score-card {
+  min-width: 240px;
+  padding: 17px 20px;
+  background: var(--dark-blue);
+  border-top: 3px solid var(--pale-gold);
 }
-.heading span{
-  color:var(--blue-gray);
-  font:700 10px Arial,sans-serif;
-  letter-spacing:.14em;
-  text-transform:uppercase;
+
+.score-card span {
+  display: block;
+  color: var(--pale-blue);
+  font: 700 10px Arial, sans-serif;
+  letter-spacing: .14em;
+  text-transform: uppercase;
 }
-.cluster-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
-.cluster-grid article,.context-grid,.validation-card{
-  background:var(--white);
-  border:1px solid var(--line);
+
+.score-card strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--white);
+  font: 500 38px "Futura PT", "Source Sans 3", Arial, sans-serif;
 }
-.cluster-grid article{border-top:5px solid var(--core)}
-.cluster-grid article:nth-child(2){border-top-color:var(--cobalt)}
-.cluster-grid header{
-  padding:16px 19px;
-  color:var(--white);
-  background:var(--dark);
-  font:500 19px "Futura PT","Source Sans 3",Arial,sans-serif;
+
+main {
+  padding: 36px 0 58px;
 }
-.overview-row{
-  display:flex;
-  justify-content:space-between;
-  gap:18px;
-  padding:14px 19px;
-  border-top:1px solid var(--line);
+
+.heading {
+  display: flex;
+  gap: 13px;
+  align-items: baseline;
+  margin: 42px 0 18px;
+  padding-bottom: 11px;
+  border-bottom: 3px solid var(--core-blue);
 }
-.overview-row b,.overview-row small{display:block}
-.overview-row b{color:var(--dark);font:700 12px Arial,sans-serif}
-.overview-row small{margin-top:4px;color:var(--blue-gray);font-size:11px}
-.overview-row strong{
-  max-width:54%;
-  text-align:right;
-  font-size:12px;
-  overflow-wrap:anywhere;
+
+.heading h2 {
+  margin: 0;
+  color: var(--dark-blue);
+  font: 500 29px "Futura PT", "Source Sans 3", Arial, sans-serif;
 }
-.context-grid{display:grid;grid-template-columns:repeat(3,1fr)}
-.context-item{
-  min-height:96px;
-  padding:19px;
-  border-right:1px solid var(--line);
-  border-bottom:1px solid var(--line);
+
+.heading span {
+  color: var(--blue-gray);
+  font: 700 10px Arial, sans-serif;
+  letter-spacing: .14em;
+  text-transform: uppercase;
 }
-.context-item:nth-child(3n){border-right:0}
-.context-item span{color:var(--blue-gray)}
-.context-item strong{
-  display:block;
-  margin-top:8px;
-  color:var(--dark);
-  font-size:16px;
-  overflow-wrap:anywhere;
+
+.cluster-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 22px;
 }
-.validation-card{
-  margin:14px 0;
-  padding:21px;
-  border-left:5px solid var(--core);
+
+.cluster-grid article,
+.context-grid,
+.validation-card {
+  background: var(--white);
+  border: 1px solid var(--line);
 }
-.validation-card.review{border-left-color:var(--gold)}
-.validation-head{display:flex;gap:12px}
-.number{
-  color:var(--cobalt);
-  font:700 12px Arial,sans-serif;
-  letter-spacing:.1em;
+
+.cluster-grid article {
+  border-top: 6px solid var(--core-blue);
 }
-.review .number{color:var(--gold)}
-.validation-head h3{
-  margin:0;
-  color:var(--dark);
-  font:500 20px "Futura PT","Source Sans 3",Arial,sans-serif;
+
+.cluster-grid article:nth-child(2) {
+  border-top-color: var(--cobalt);
 }
-.validation-head p{
-  margin:8px 0 0;
-  color:var(--blue-gray);
-  font:12px Consolas,"Courier New",monospace;
-  overflow-wrap:anywhere;
+
+.cluster-grid header {
+  padding: 17px 20px;
+  color: var(--white);
+  background: var(--dark-blue);
+  font: 500 20px "Futura PT", "Source Sans 3", Arial, sans-serif;
 }
-.outcome-field{
-  margin:17px 0 0 25px;
-  padding:11px 13px;
-  color:var(--dark);
-  background:var(--pale-blue);
-  border-left:3px solid var(--cobalt);
-  font-size:13px;
+
+.overview-row {
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+  padding: 15px 20px;
+  border-top: 1px solid var(--line);
 }
-.review .outcome-field{
-  background:var(--pale-gold);
-  border-left-color:var(--gold);
+
+.overview-row b,
+.overview-row small {
+  display: block;
 }
-.outcome-field span{
-  margin-right:9px;
-  color:var(--blue-gray);
-  font:700 10px Arial,sans-serif;
-  letter-spacing:.1em;
-  text-transform:uppercase;
+
+.overview-row b {
+  color: var(--dark-blue);
+  font: 700 12px Arial, sans-serif;
 }
-.review-note{
-  margin:15px 0;
-  padding:11px 13px;
-  color:var(--dark);
-  background:var(--pale-gold);
-  border-left:3px solid var(--gold);
-  font-size:13px;
+
+.overview-row small {
+  margin-top: 4px;
+  color: var(--blue-gray);
+  font-size: 11px;
 }
-details{margin-top:17px}
-summary{
-  cursor:pointer;
-  color:var(--core);
-  font:700 12px Arial,sans-serif;
+
+.overview-row strong {
+  max-width: 54%;
+  color: var(--dark-gray);
+  text-align: right;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
-pre{
-  max-height:345px;
-  overflow:auto;
-  margin:12px 0 0;
-  padding:16px;
-  color:var(--white);
-  background:var(--dark);
-  border-top:4px solid var(--cobalt);
-  font:12px/1.5 Consolas,"Courier New",monospace;
+
+.context-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
-.manuals{
-  padding:25px;
-  background:var(--pale-gold);
-  border-top:5px solid #EDD7A0;
+
+.context-item {
+  min-height: 98px;
+  padding: 19px 20px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
 }
-.manual-card{
-  padding:19px 0;
-  border-top:1px solid #DEC98F;
+
+.context-item:nth-child(3n) {
+  border-right: 0;
 }
-.manual-card:first-child{padding-top:0;border-top:0}
-.manual-card>span{
-  color:var(--blue-gray);
-  font:700 10px Arial,sans-serif;
-  letter-spacing:.12em;
-  text-transform:uppercase;
+
+.context-item span {
+  display: block;
+  color: var(--blue-gray);
+  font: 700 10px Arial, sans-serif;
+  letter-spacing: .13em;
+  text-transform: uppercase;
 }
-.manual-card h3{
-  margin:5px 0 0;
-  color:var(--dark);
-  font:500 19px "Futura PT","Source Sans 3",Arial,sans-serif;
+
+.context-item strong {
+  display: block;
+  margin-top: 8px;
+  color: var(--dark-blue);
+  font-size: 16px;
+  overflow-wrap: anywhere;
 }
-.manual-card code{
-  display:block;
-  margin:10px 0;
-  padding:10px;
-  color:var(--white);
-  background:var(--dark);
-  font:12px Consolas,"Courier New",monospace;
-  overflow-wrap:anywhere;
+
+.validation-card {
+  margin: 15px 0;
+  padding: 22px;
+  border-left: 6px solid var(--core-blue);
 }
-.manual-card p,.manual-card ol{font-size:13px}
-.manual-card ol{padding-left:20px}
-@media(max-width:760px){
-  .cluster-grid,.context-grid{grid-template-columns:1fr}
-  .context-item,.context-item:nth-child(3n){border-right:0}
-  .overview-row{display:block}
-  .overview-row strong{
-    display:block;
-    max-width:100%;
-    margin-top:7px;
-    text-align:left;
+
+.validation-card.review {
+  border-left-color: #CE8E49;
+}
+
+.validation-head {
+  display: flex;
+  gap: 13px;
+}
+
+.number {
+  padding-top: 3px;
+  color: var(--cobalt);
+  font: 700 12px Arial, sans-serif;
+  letter-spacing: .1em;
+}
+
+.review .number {
+  color: #CE8E49;
+}
+
+.validation-head h3 {
+  margin: 0;
+  color: var(--dark-blue);
+  font: 500 21px "Futura PT", "Source Sans 3", Arial, sans-serif;
+}
+
+.validation-head p {
+  margin: 8px 0 0;
+  color: var(--blue-gray);
+  font: 12px Consolas, "Courier New", monospace;
+  overflow-wrap: anywhere;
+}
+
+.outcome-field {
+  margin: 18px 0 0 25px;
+  padding: 12px 14px;
+  color: var(--dark-blue);
+  background: var(--pale-blue);
+  border-left: 4px solid var(--cobalt);
+  font-size: 13px;
+}
+
+.review .outcome-field {
+  background: var(--pale-gold-soft);
+  border-left-color: #CE8E49;
+}
+
+.outcome-field span {
+  margin-right: 10px;
+  color: var(--blue-gray);
+  font: 700 10px Arial, sans-serif;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+.review-note {
+  margin: 16px 0;
+  padding: 12px 14px;
+  color: var(--dark-blue);
+  background: var(--pale-gold-soft);
+  border-left: 4px solid #CE8E49;
+  font-size: 13px;
+}
+
+details {
+  margin-top: 18px;
+}
+
+summary {
+  cursor: pointer;
+  color: var(--core-blue);
+  font: 700 12px Arial, sans-serif;
+}
+
+pre {
+  max-height: 350px;
+  overflow: auto;
+  margin: 12px 0 0;
+  padding: 16px;
+  color: var(--white);
+  background: var(--dark-blue);
+  border-top: 4px solid var(--cobalt);
+  font: 12px/1.5 Consolas, "Courier New", monospace;
+}
+
+.manuals {
+  padding: 26px;
+  background: var(--pale-gold-soft);
+  border-top: 6px solid var(--pale-gold);
+}
+
+.manual-card {
+  padding: 20px 0;
+  border-top: 1px solid #DEC98F;
+}
+
+.manual-card:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.manual-label {
+  color: var(--blue-gray);
+  font: 700 10px Arial, sans-serif;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+}
+
+.manual-card h3 {
+  margin: 6px 0 0;
+  color: var(--dark-blue);
+  font: 500 20px "Futura PT", "Source Sans 3", Arial, sans-serif;
+}
+
+.manual-card code {
+  display: block;
+  margin: 11px 0;
+  padding: 11px;
+  color: var(--white);
+  background: var(--dark-blue);
+  font: 12px Consolas, "Courier New", monospace;
+  overflow-wrap: anywhere;
+}
+
+.manual-card p,
+.manual-card ol {
+  color: var(--dark-gray);
+  font-size: 13px;
+}
+
+.manual-card ol {
+  padding-left: 21px;
+}
+
+@media (max-width: 760px) {
+  .cluster-grid,
+  .context-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .context-item,
+  .context-item:nth-child(3n) {
+    border-right: 0;
+  }
+
+  .overview-row {
+    display: block;
+  }
+
+  .overview-row strong {
+    display: block;
+    max-width: 100%;
+    margin-top: 7px;
+    text-align: left;
   }
 }
-@media(max-width:560px){
-  h1{font-size:31px}
-  .score-grid{display:block}
-  .score-card{margin:10px 0}
+
+@media (max-width: 560px) {
+  h1 {
+    font-size: 32px;
+  }
+
+  .score-grid {
+    display: block;
+  }
+
+  .score-card {
+    margin: 10px 0;
+  }
 }
 </style>
 </head>
@@ -1729,11 +1865,13 @@ pre{
     <p class="eyebrow">Technology Operations | Vault AMI Validation</p>
     <h1>$environment Validation Report</h1>
     <p class="meta">Run label: $label | Generated: $timestamp UTC</p>
+
     <div class="score-grid">
       <div class="score-card">
         <span>Primary score</span>
         <strong>$primary_score / $primary_total</strong>
       </div>
+
       <div class="score-card">
         <span>DR score</span>
         <strong>$dr_score / $dr_total</strong>
@@ -1775,7 +1913,6 @@ pre{
 </main>
 </body>
 </html>""")
-
 
 def create_report(results, context):
     primary = [item for item in results if item.section == "Primary"]
