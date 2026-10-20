@@ -597,87 +597,6 @@ def check_snapshot_config(runner, context):
     })
 
 
-def check_snapshot_status(runner, context):
-    attempts = int(
-        context["profile"].get("snapshot_status_retry_attempts", 5)
-    )
-
-    delay = int(
-        context["profile"].get("snapshot_status_retry_delay_seconds", 60)
-    )
-
-    max_age = int(
-        context["profile"].get("snapshot_max_age_seconds", 2400)
-    )
-
-    last_error = None
-
-    for attempt in range(1, attempts + 1):
-        try:
-            payload = runner.json(
-                [
-                    "vault", "read", "-format=json",
-                    "sys/storage/raft/snapshot-auto/status/s3"
-                ],
-                context["primary_env"]
-            )
-
-            data = extract_data(payload)
-
-            latest_text = find_first(data, [
-                "last_snapshot_time",
-                "last_snapshot",
-                "last_successful_snapshot"
-            ])
-
-            latest = parse_time(latest_text)
-
-            expect(
-                latest is not None,
-                "Latest snapshot timestamp was not found."
-            )
-
-            age = (
-                datetime.datetime.now(datetime.timezone.utc) - latest
-            ).total_seconds()
-
-            expect(
-                age <= max_age,
-                "Latest snapshot is {0:.0f} seconds old.".format(age)
-            )
-
-            return evidence(payload, {
-                "latest_snapshot": latest_text,
-                "next_snapshot": find_first(
-                    data,
-                    ["next_snapshot_time", "next_snapshot"]
-                ),
-                "age_seconds": int(age),
-                "maximum_age_seconds": max_age,
-                "successful_attempt": attempt,
-                "total_attempts_allowed": attempts
-            })
-
-        except (ValidationError, CommandError) as exc:
-            last_error = exc
-
-            if attempt < attempts:
-                print(
-                    "Snapshot status not ready. Retrying in {0} seconds "
-                    "(attempt {1}/{2})...".format(
-                        delay,
-                        attempt,
-                        attempts
-                    )
-                )
-                time.sleep(delay)
-
-    raise ValidationError(
-        "Snapshot status did not meet expected condition after {0} "
-        "attempts: {1}".format(attempts, last_error)
-    )
-
-
 def check_replication(runner, environment, expected_mode, expected_state):
     payload = runner.json(
         ["vault", "read", "-format=json", "sys/replication/status"],
@@ -1446,6 +1365,16 @@ def manual_cards(results, context):
             "Attach the successful build URL to the change record."
         ]
     })
+    items.append({
+    "title": "Latest Raft Snapshot Timestamp",
+    "reason": (
+        "Permanently manual validation. Confirm that a new Raft snapshot "
+        "exists after the AMI upgrade."
+    ),
+    "steps": latest_snapshot_steps,
+    "command": latest_snapshot_command,
+    "snapshot_backend": backend
+})
 
     output = ""
 
