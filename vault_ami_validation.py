@@ -1369,8 +1369,18 @@ def manual_cards(results, context):
     "title": "Latest Raft Snapshot Timestamp",
     "reason": (
         "Permanently manual validation. Confirm that a new Raft snapshot "
-        "exists after the AMI upgrade."
+        "was generated after the AMI upgrade."
     ),
+    "steps": (
+        "1. Open the cloud console for the selected environment. "
+        "2. Navigate to the configured primary Raft snapshot storage bucket. "
+        "3. Open the `raft-snapshots/` location. "
+        "4. Identify the most recently modified snapshot object. "
+        "5. Confirm its timestamp is later than the AMI upgrade completion "
+        "time and that the object has a non-zero size. "
+        "6. Record the snapshot name, timestamp, and size in the change "
+        "validation evidence."
+    )
 })
 
     output = ""
