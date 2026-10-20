@@ -1371,7 +1371,6 @@ def manual_cards(results, context):
         "Permanently manual validation. Confirm that a new Raft snapshot "
         "exists after the AMI upgrade."
     ),
-    "steps": latest_snapshot_steps,
     "command": latest_snapshot_command,
     "snapshot_backend": backend
 })
