@@ -1062,37 +1062,10 @@ def run_validations(context):
          lambda: check_tls(context["profile"]["dr_addr"]), False)
     ]
 
-    if context["profile"].get("provider") != "aws" or context["aws_enabled"]:
-        checks.insert(
-            12,
-            (
-                "Primary", "Latest raft snapshots (Primary)",
-                "aws s3api list-objects-v2 --bucket "
-                "<configured-bucket> --prefix <configured-prefix> "
-                "--output json",
-                "Latest 3 raft snapshots are found in cloud storage.",
-                ["Confirm latest snapshots are after AMI activity."],
-                lambda: check_cloud_snapshots(runner, context),
-                False
-            )
-        )
-    else:
-        context["manual_items"].append({
-            "title": "Latest raft snapshots (Primary)",
-            "command": "aws s3api list-objects-v2 --bucket "
-            "<configured-bucket> --prefix <configured-prefix> --output json",
-            "reason": context["aws_skip_reason"],
-            "steps": [
-                "Open the configured S3 bucket and raft-snapshots prefix.",
-                "Confirm latest three snapshot timestamps are after AMI activity."
-            ]
-        })
-
     for index, item in enumerate(checks, 1):
         print("[{0}/{1}] {2}".format(index, len(checks), item[1]))
 
-        execute(
-            results, item[0], item[1], item[2],
+        execute(            results, item[0], item[1], item[2],
             item[3], item[4], item[5], item[6]
         )
 
