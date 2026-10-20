@@ -1359,29 +1359,39 @@ def manual_cards(results, context):
 
     output = ""
 
-    for item in items:
-        steps = "".join([
-            "<li>{0}</li>".format(html.escape(step))
-            for step in item["steps"]
-        ])
+for item in items:
+    steps = " ".join([
+        "{0}.".format(html.escape(step).rstrip("."))
+        for step in item.get("steps", [])
+    ])
 
-        output += """
-        <article class="manual-card">
-          <span class="manual-label">Required follow-up</span>
-          <h3>{0}</h3>
-          <code>{1}</code>
-          <p>{2}</p>
-          <ol>{3}</ol>
-        </article>
-        """.format(
-            html.escape(item["title"]),
-            html.escape(item["command"]),
-            html.escape(item["reason"]),
-            steps
+    command = item.get("command", "")
+
+    command_html = ""
+
+    if command:
+        command_html = "<code>{0}</code>".format(
+            html.escape(command)
         )
 
-    return output
+    output += """
+    <article class="manual-card">
+      <span class="manual-label">Required follow-up</span>
+      <h3>{0}</h3>
+      {1}
+      <p>{2}</p>
+      <div class="manual-steps">
+        <strong>Procedure:</strong> {3}
+      </div>
+    </article>
+    """.format(
+        html.escape(item["title"]),
+        command_html,
+        html.escape(item["reason"]),
+        steps
+    )
 
+return output
 HTML = Template("""<!doctype html>
 <html lang="en">
 <head>
