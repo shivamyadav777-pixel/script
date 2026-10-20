@@ -68,6 +68,14 @@ def command_text(command):
         output.append(value)
 
     return " ".join(output)
+    
+def snapshot_backend(context):
+    provider = context["profile"].get("provider", "aws").strip().lower()
+
+    if provider == "gcp":
+        return "gcs"
+
+    return "s3"
 
 
 class Runner(object):
@@ -495,26 +503,20 @@ def check_autopilot(runner, environment, dr_token=None):
 
 def check_secret_write(runner, context):
     command = [
-        "vault", "write", "-format=json",
+        "vault", "kv", "put", "-format=json",
         context["test_path"], "Test=success"
     ]
-
     output = runner.run(command, context["primary_env"])
 
-    try:
-        response = json.loads(output) if output.strip() else {}
-    except ValueError:
-        response = {"message": output.strip()}
-
-    if not response:
-        response = {
-            "message": "Vault accepted the write with no response body."
-        }
-
-    return evidence(response, {
+    return evidence({
+        "message": "Test secret written successfully.",
+        "validation_path": context["test_path"],
+        "vault_output": output.strip() or "No output returned by Vault."
+    }, {
         "validation_path": context["test_path"],
         "write_command_completed": True
     })
+
 
 
 def find_test(value):
@@ -540,28 +542,33 @@ def find_test(value):
 
 def check_secret_read(runner, context):
     payload = runner.json(
-        ["vault", "read", "-format=json", context["test_path"]],
+        ["vault", "kv", "get", "-format=json", context["test_path"]],
         context["primary_env"]
     )
 
     value = find_test(payload)
-
     expect(
         str(value).lower() == "success",
-        "Expected Test=success; got {0}.".format(value)
+        "Expected Test=success, got {0}".format(value)
     )
 
     return evidence(payload, {
         "validation_path": context["test_path"],
-        "Test": value
+        "expected_value": "success",
+        "actual_value": value
     })
 
 
 def check_snapshot_config(runner, context):
+    backend = snapshot_backend(context)
+    snapshot_path = (
+        "sys/storage/raft/snapshot-auto/config/{0}"
+    ).format(backend)
+
     payload = runner.json(
         [
             "vault", "read", "-format=json",
-            "sys/storage/raft/snapshot-auto/config/s3"
+            snapshot_path
         ],
         context["primary_env"],
         retries=3
@@ -583,6 +590,8 @@ def check_snapshot_config(runner, context):
     )
 
     return evidence(payload, {
+        "snapshot_backend": backend,
+        "snapshot_config_path": snapshot_path,
         "expected_interval_seconds": expected,
         "reported_interval_seconds": interval
     })
