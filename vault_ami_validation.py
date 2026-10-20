@@ -1340,6 +1340,7 @@ def manual_cards(results, context):
     })
     items.append({
             "title": "Latest Raft Snapshot Timestamp",
+            "command": "Manual Snapshot Validation",
             "reason": (
                 "Permanent manual validation. Confirm that a new Raft "
                 "snapshot was generated after the AMI upgrade."
