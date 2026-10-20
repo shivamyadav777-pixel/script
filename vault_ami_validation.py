@@ -1420,12 +1420,8 @@ def manual_cards(results, context):
     items.append({
         "title": "Snapshot runtime status retry validation",
         "command": (
-            "for i in 1 2 3 4 5; do "
-            "echo \"Snapshot status attempt $i/5\"; "
             "vault read -format=json "
             "sys/storage/raft/snapshot-auto/status/s3 && break; "
-            "[ $i -lt 5 ] && sleep 60; "
-            "done"
         ),
         "reason": (
             "This is a permanent manual post-AMI validation. "
