@@ -1338,14 +1338,16 @@ def manual_cards(results, context):
             "Attach the successful build URL to the change record."
         ]
     })
+
     items.append({
-            "title": "Latest Raft Snapshot Timestamp",
-            "command": "Manual Snapshot Validation",
-            "reason": (
-                "Permanent manual validation. Confirm that a new Raft "
-                "snapshot was generated after the AMI upgrade."
-            ),
-            "steps": (
+        "title": "Latest Raft Snapshot Timestamp",
+        "command": "Manual Snapshot Validation",
+        "reason": (
+            "Permanent manual validation. Confirm that a new Raft "
+            "snapshot was generated after the AMI upgrade."
+        ),
+        "steps": [
+            (
                 "Open the cloud console for the selected environment. "
                 "Navigate to the configured primary Raft snapshot storage "
                 "bucket and open `raft-snapshots/`. Identify the most "
@@ -1354,44 +1356,49 @@ def manual_cards(results, context):
                 "object has a non-zero size. Record the name, timestamp, "
                 "and object size as change evidence."
             )
-        
-})
+        ]
+    })
 
     output = ""
 
-for item in items:
-    steps = " ".join([
-        "{0}.".format(html.escape(step).rstrip("."))
-        for step in item.get("steps", [])
-    ])
+    for item in items:
+        item_steps = item.get("steps", [])
 
-    command = item.get("command", "")
+        if isinstance(item_steps, str):
+            item_steps = [item_steps]
 
-    command_html = ""
+        steps = " ".join([
+            "{0}.".format(html.escape(str(step)).rstrip("."))
+            for step in item_steps
+        ])
 
-    if command:
-        command_html = "<code>{0}</code>".format(
-            html.escape(command)
+        command = item.get("command", "")
+        command_html = ""
+
+        if command:
+            command_html = "<code>{0}</code>".format(
+                html.escape(str(command))
+            )
+
+        output += """
+        <article class="manual-card">
+          <span class="manual-label">Required follow-up</span>
+          <h3>{0}</h3>
+          {1}
+          <p>{2}</p>
+          <div class="manual-steps">
+            <strong>Procedure:</strong> {3}
+          </div>
+        </article>
+        """.format(
+            html.escape(str(item["title"])),
+            command_html,
+            html.escape(str(item["reason"])),
+            steps
         )
 
-    output += """
-    <article class="manual-card">
-      <span class="manual-label">Required follow-up</span>
-      <h3>{0}</h3>
-      {1}
-      <p>{2}</p>
-      <div class="manual-steps">
-        <strong>Procedure:</strong> {3}
-      </div>
-    </article>
-    """.format(
-        html.escape(item["title"]),
-        command_html,
-        html.escape(item["reason"]),
-        steps
-    )
+    return output
 
-return output
 HTML = Template("""<!doctype html>
 <html lang="en">
 <head>
