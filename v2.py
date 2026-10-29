@@ -268,15 +268,9 @@ def required_secret(label):
 
 
 def primary_token_from_environment():
-    token = os.environ.get("VAULT_TOKEN", "").strip()
-
-    if not token:
-        raise ValidationError(
-            "VAULT_TOKEN is not set. Authenticate to Vault in Dojo before "
-            "starting validation."
-        )
-
-    return token
+    # `vault login` commonly stores this in the Vault CLI token helper rather
+    # than exporting VAULT_TOKEN. An empty result lets the CLI use that helper.
+    return os.environ.get("VAULT_TOKEN", "").strip()
 
 
 def configured_secret_path(value, label):
@@ -422,8 +416,8 @@ def get_context():
     validation_type, change_number, label = get_validation_details()
     upload_requested = get_upload_choice()
 
-    print("\nVault credentials are read from the Dojo environment only and "
-          "are never saved.")
+    print("\nVault authentication is read from VAULT_TOKEN or the existing "
+          "Dojo Vault CLI login and is never saved by this script.")
 
     primary_token = primary_token_from_environment()
 
@@ -444,10 +438,10 @@ def get_context():
         timestamp
     )
 
-    primary_env = {
-        "VAULT_ADDR": profile["primary_addr"],
-        "VAULT_TOKEN": primary_token
-    }
+    primary_env = {"VAULT_ADDR": profile["primary_addr"]}
+
+    if primary_token:
+        primary_env["VAULT_TOKEN"] = primary_token
 
     dr_token = retrieve_dr_token(primary_env, profile, config)
 
