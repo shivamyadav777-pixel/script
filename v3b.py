@@ -24,7 +24,7 @@ from urllib.error import HTTPError, URLError
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, "vault_validation_config.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "vault_env.json")
 REPORT_DIR = os.path.join(BASE_DIR, "reports")
 IST_OFFSET = datetime.timedelta(hours=5, minutes=30)
 
