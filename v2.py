@@ -1213,15 +1213,22 @@ def change_mount_workflow(runner, context, results):
             "vault kv delete -mount={0} {1}".format(mount, secret_path),
             "Only the current validation secret is soft-deleted.", "verified"
         )
-        runner.run(
-            ["vault", "kv", "get", "-format=json",
+        delete_metadata = runner.json(
+            ["vault", "kv", "metadata", "get", "-format=json",
              "-mount={0}".format(mount), secret_path],
-            context["primary_env"], codes=[2]
+            context["primary_env"]
+        )
+        deletion_time = find_first(delete_metadata, ["deletion_time"])
+        expect(
+            bool(deletion_time),
+            "KV v2 deletion metadata did not include a deletion timestamp."
         )
         workflow_result(
             results, "Verify validation secret deletion",
-            "vault kv get -mount={0} {1}".format(mount, secret_path),
-            "The soft-deleted validation secret is no longer readable.",
+            "vault kv metadata get -mount={0} {1}".format(
+                mount, secret_path
+            ),
+            "KV v2 metadata shows the validation secret was soft-deleted.",
             "verified"
         )
         secret_deleted = True
@@ -1285,8 +1292,6 @@ def run_validations(context):
 
     primary = context["primary_env"]
     dr = context["dr_env"]
-    path = context["test_path"]
-
     checks = [
         ("Primary", "Vault status (Primary)",
          "vault status -format=json",
@@ -1305,18 +1310,6 @@ def run_validations(context):
          "Autopilot configuration JSON is retrieved successfully.",
          ["Compare output with the approved configuration."],
          lambda: check_autopilot(runner, primary), False),
-
-        ("Primary", "Validation secret write (Primary)",
-         "vault write -format=json {0} Test=success".format(path),
-         "Vault accepts Test=success at the generated validation path.",
-         ["Confirm token write access to the validation path."],
-         lambda: check_secret_write(runner, context), False),
-
-        ("Primary", "Validation secret read (Primary)",
-         "vault read -format=json {0}".format(path),
-         "The generated validation path returns Test=success.",
-         ["Confirm Test=success is returned."],
-         lambda: check_secret_read(runner, context), False),
 
         ("Primary", "Snapshot configuration (Primary)",
          "vault read -format=json "
