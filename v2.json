@@ -1,0 +1,78 @@
+{
+  "dr_token_secret_path": "<VAULT_KV_V1_DR_TOKEN_PATH>",
+  "artifactory": {
+    "secret_path": "<VAULT_KV_V2_ARTIFACTORY_PATH>",
+    "kv_version": 2,
+    "url_field": "url",
+    "repository_field": "repository",
+    "api_key_field": "api_key",
+    "api_key_header": "X-JFrog-Art-Api"
+  },
+  "environments": {
+    "awsle1": {
+      "provider": "aws",
+      "tier": "inc",
+      "primary_addr": "<AWS_LE1_PRIMARY_VAULT_URL>",
+      "dr_addr": "https://nlb-vault-dr.is-vault-inc.us-east-1.aws.aig.net:8200/",
+      "snapshot_bucket": "vault-inc-primary-raft-snapshots",
+      "snapshot_prefix": "raft-snapshots/",
+      "test_secret_prefix": "kv-testing/test/ami-validation",
+      "snapshot_interval_seconds": 28800,
+      "snapshot_max_age_seconds": 28800,
+      "dr_token_key": "le1-vault",
+      "validation_kv_version": 2
+    },
+    "awsxe1": {
+      "provider": "aws",
+      "tier": "nprd",
+      "primary_addr": "<AWS_XE1_PRIMARY_VAULT_URL>",
+      "dr_addr": "https://nlb-vault-dr.is-vault-nonprod.us-east-1.aws.aig.net:8200",
+      "snapshot_bucket": "vault-nprd-primary-raft-snapshots",
+      "snapshot_prefix": "raft-snapshots/",
+      "test_secret_prefix": "kv-test-AMI-Upgrade/test/ami-validation",
+      "snapshot_interval_seconds": 1800,
+      "snapshot_max_age_seconds": 2400,
+      "dr_token_key": "xe1-vault",
+      "validation_kv_version": 2
+    },
+    "awspe1": {
+      "provider": "aws",
+      "tier": "prod",
+      "primary_addr": "https://pe1.vault.aig.net",
+      "dr_addr": "https://nlb-vault-dr.is-vault-prod.us-east-1.aws.aig.net:8200/",
+      "snapshot_bucket": "vault-prod-primary-raft-snapshots",
+      "snapshot_prefix": "raft-snapshots/",
+      "test_secret_prefix": "kv-test/test/ami-validation-script",
+      "snapshot_interval_seconds": 1800,
+      "snapshot_max_age_seconds": 2400,
+      "dr_token_key": "pe1-vault",
+      "validation_kv_version": 2
+    },
+    "gcpxe1": {
+      "provider": "gcp",
+      "tier": "nprd",
+      "primary_addr": "https://vault.aig-core-ent-platforms-x.gcp.cloud.aig.net:8200",
+      "dr_addr": "https://vault-dr.aig-core-ent-platforms-x.gcp.cloud.aig.net",
+      "snapshot_bucket": "<GCP_XE1_SNAPSHOT_BUCKET>",
+      "snapshot_prefix": "raft-snapshots/",
+      "test_secret_prefix": "kv-test/test/ami-validation",
+      "snapshot_interval_seconds": 28800,
+      "snapshot_max_age_seconds": 30000,
+      "dr_token_key": "xe1-gcp-vault",
+      "validation_kv_version": 2
+    },
+    "gcppe1": {
+      "provider": "gcp",
+      "tier": "prod",
+      "primary_addr": "https://vault.aig-core-ent-platforms-p.gcp.cloud.aig.net:8200",
+      "dr_addr": "https://vault-dr.aig-core-ent-platforms-p.gcp.cloud.aig.net",
+      "snapshot_bucket": "<GCP_PE1_SNAPSHOT_BUCKET>",
+      "snapshot_prefix": "raft-snapshots/",
+      "test_secret_prefix": "kv-test/ami-validation-script",
+      "snapshot_interval_seconds": 1800,
+      "snapshot_max_age_seconds": 30000,
+      "dr_token_key": "pe1-gcp-vault",
+      "validation_kv_version": 2
+    }
+  }
+}
