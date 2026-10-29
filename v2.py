@@ -24,7 +24,7 @@ from urllib.error import HTTPError, URLError
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, "vault_validation_config.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "vault_env.json")
 REPORT_DIR = os.path.join(BASE_DIR, "reports")
 IST_OFFSET = datetime.timedelta(hours=5, minutes=30)
 
@@ -267,6 +267,18 @@ def required_secret(label):
     raise ValidationError("Required input was not supplied.")
 
 
+def primary_token_from_environment():
+    token = os.environ.get("VAULT_TOKEN", "").strip()
+
+    if not token:
+        raise ValidationError(
+            "VAULT_TOKEN is not set. Authenticate to Vault in Dojo before "
+            "starting validation."
+        )
+
+    return token
+
+
 def configured_secret_path(value, label):
     value = str(value or "").strip()
 
@@ -410,9 +422,10 @@ def get_context():
     validation_type, change_number, label = get_validation_details()
     upload_requested = get_upload_choice()
 
-    print("\nTokens remain in memory only and are never saved.")
+    print("\nVault credentials are read from the Dojo environment only and "
+          "are never saved.")
 
-    primary_token = required_secret("Primary Vault token: ")
+    primary_token = primary_token_from_environment()
 
     aws_enabled = False
     aws_env = {}
