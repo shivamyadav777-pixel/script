@@ -144,7 +144,14 @@ def detect_environment(config):
     matches = []
 
     for name, profile in config["environments"].items():
-        if canonical_vault_address(profile.get("primary_addr", "")) == current_address:
+        configured_address = str(profile.get("primary_addr", "")).strip()
+
+        # Other profiles may intentionally remain placeholders; they must not
+        # prevent detection of a fully configured target environment.
+        if not configured_address or configured_address.startswith("<"):
+            continue
+
+        if canonical_vault_address(configured_address) == current_address:
             matches.append((name, profile))
 
     if len(matches) != 1:
